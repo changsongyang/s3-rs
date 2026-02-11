@@ -1,3 +1,8 @@
+## [0.1.10] - 2026-02-11
+
+### 🐛 Bug Fixes
+
+- *(transport)* Add HEAD content-encoding regression coverage for async and blocking
 ## [0.1.9] - 2026-02-11
 
 ### 🚀 Features
@@ -7,6 +12,10 @@
 ### 🧪 Testing
 
 - *(store)* Add TLS root-store coverage for client and credential flows
+
+### ⚙️ Miscellaneous Tasks
+
+- Release s3 version 0.1.9
 ## [0.1.8] - 2026-01-12
 
 ### ⚙️ Miscellaneous Tasks
