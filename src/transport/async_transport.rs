@@ -553,6 +553,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_head_with_content_encoding_and_empty_body_returns_ok() -> Result<()> {
+        let (addr, handle, hits) = spawn_test_server(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ])?;
+
+        let retry = RetryConfig {
+            max_attempts: 1,
+            ..RetryConfig::default()
+        };
+        let transport = AsyncTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let resp = transport
+            .send(Method::HEAD, url, HeaderMap::new(), AsyncBody::Empty)
+            .await?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("zstd")
+        );
+        assert!(resp.body().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn response_error_extracts_rate_limit() -> Result<()> {
         let (addr, handle, _) = spawn_test_server(vec![
             b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\nx-amz-request-id: req-1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),

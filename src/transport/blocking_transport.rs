@@ -427,7 +427,78 @@ fn default_user_agent() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
     use super::*;
+
+    fn spawn_test_server(
+        responses: Vec<Vec<u8>>,
+    ) -> Result<(SocketAddr, std::thread::JoinHandle<()>, Arc<AtomicUsize>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| Error::transport("failed to bind test server", Some(Box::new(e))))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| Error::transport("failed to configure test server", Some(Box::new(e))))?;
+        let addr = listener.local_addr().map_err(|e| {
+            Error::transport("failed to read test server address", Some(Box::new(e)))
+        })?;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_thread = hits.clone();
+
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for response in responses {
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                            let mut request = Vec::new();
+                            let mut buf = [0u8; 1024];
+                            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                match stream.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        request.extend_from_slice(&buf[..n]);
+                                        if request.len() > 64 * 1024 {
+                                            break;
+                                        }
+                                    }
+                                    Err(err)
+                                        if matches!(
+                                            err.kind(),
+                                            ErrorKind::WouldBlock | ErrorKind::TimedOut
+                                        ) =>
+                                    {
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            let _ = stream.write_all(&response);
+                            let _ = stream.flush();
+                            hits_thread.fetch_add(1, Ordering::SeqCst);
+                            break;
+                        }
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+        });
+
+        Ok((addr, handle, hits))
+    }
 
     #[test]
     fn response_error_extracts_rate_limit() {
@@ -491,64 +562,9 @@ mod tests {
 
     #[test]
     fn send_returns_response_for_http_error_status() -> Result<()> {
-        use std::io::{ErrorKind, Read, Write};
-        use std::net::TcpListener;
-        use std::time::Instant;
-
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| Error::transport("failed to bind test server", Some(Box::new(e))))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|e| Error::transport("failed to configure test server", Some(Box::new(e))))?;
-        let addr = listener.local_addr().map_err(|e| {
-            Error::transport("failed to read test server address", Some(Box::new(e)))
-        })?;
-
-        let handle = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                        let mut request = Vec::new();
-                        let mut buf = [0u8; 1024];
-                        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                            match stream.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    request.extend_from_slice(&buf[..n]);
-                                    if request.len() > 64 * 1024 {
-                                        break;
-                                    }
-                                }
-                                Err(err)
-                                    if matches!(
-                                        err.kind(),
-                                        ErrorKind::WouldBlock | ErrorKind::TimedOut
-                                    ) =>
-                                {
-                                    break;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
-                        let _ = stream.flush();
-                        break;
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let (addr, handle, hits) = spawn_test_server(vec![
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ])?;
 
         let retry = RetryConfig {
             max_attempts: 1,
@@ -568,7 +584,46 @@ mod tests {
             .join()
             .map_err(|_| Error::transport("test server thread panicked", None))?;
         let resp = resp_result?;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[test]
+    fn send_head_with_content_encoding_and_empty_body_returns_ok() -> Result<()> {
+        let (addr, handle, hits) = spawn_test_server(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ])?;
+
+        let retry = RetryConfig {
+            max_attempts: 1,
+            ..RetryConfig::default()
+        };
+        let transport = BlockingTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::System,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let resp = transport.send(Method::HEAD, url, HeaderMap::new(), BlockingBody::Empty)?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (parts, body) = resp.into_parts();
+        assert_eq!(
+            parts
+                .headers
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("zstd")
+        );
+        assert!(body.into_reader().into_inner().is_empty());
         Ok(())
     }
 }
