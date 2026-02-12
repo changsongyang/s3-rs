@@ -13,8 +13,9 @@ use url::Url;
 use crate::{
     error::{Error, Result},
     transport::{
-        RetryConfig, backoff_delay, map_reqx_error, response_error_from_status,
-        retry_after_from_headers,
+        RetryConfig, backoff_delay, followed_redirect, is_retryable_method, map_reqx_error,
+        response_error_from_status, response_service_error, retry_after_from_headers,
+        should_retry_error, should_retry_status, unexpected_redirect_error,
     },
 };
 
@@ -143,9 +144,23 @@ impl AsyncTransport {
                 #[cfg(feature = "metrics")]
                 let start = Instant::now();
 
-                let req = self.build_request(&method, url, headers, body)?;
-                match req.send().await {
+                let req = self.build_request(&method, url.clone(), headers, body)?;
+                match req.send_stream().await {
                     Ok(resp) => {
+                        if followed_redirect(&url, resp.uri()) {
+                            #[cfg(feature = "metrics")]
+                            metrics::counter!(
+                                "s3_http_errors_total",
+                                "method" => method_label(&method),
+                                "kind" => "redirect"
+                            )
+                            .increment(1);
+                            return Err(unexpected_redirect_error(&method, &url, resp.uri()));
+                        }
+                        let resp = resp
+                            .into_response_limited(MAX_BUFFERED_RESPONSE_BODY_BYTES)
+                            .await
+                            .map_err(|err| map_reqx_error("request failed", err))?;
                         #[cfg(feature = "metrics")]
                         {
                             metrics::counter!(
@@ -175,7 +190,7 @@ impl AsyncTransport {
                 }
             }
             replayable => {
-                let max_attempts = if replayable.is_replayable() {
+                let max_attempts = if replayable.is_replayable() && is_retryable_method(&method) {
                     self.retry.max_attempts
                 } else {
                     1
@@ -202,8 +217,18 @@ impl AsyncTransport {
                     let req =
                         self.build_request(&method, url.clone(), headers.clone(), current_body)?;
 
-                    match req.send().await {
+                    match req.send_stream().await {
                         Ok(resp) => {
+                            if followed_redirect(&url, resp.uri()) {
+                                #[cfg(feature = "metrics")]
+                                metrics::counter!(
+                                    "s3_http_errors_total",
+                                    "method" => method_label(&method),
+                                    "kind" => "redirect"
+                                )
+                                .increment(1);
+                                return Err(unexpected_redirect_error(&method, &url, resp.uri()));
+                            }
                             #[cfg(feature = "metrics")]
                             metrics::counter!(
                                 "s3_http_responses_total",
@@ -235,6 +260,46 @@ impl AsyncTransport {
                                 drop(resp);
                                 tokio::time::sleep(delay).await;
                                 continue;
+                            }
+                            let resp = match resp
+                                .into_response_limited(MAX_BUFFERED_RESPONSE_BODY_BYTES)
+                                .await
+                            {
+                                Ok(resp) => resp,
+                                Err(err) => {
+                                    if attempt < max_attempts && should_retry_error(&err) {
+                                        #[cfg(feature = "metrics")]
+                                        metrics::counter!(
+                                            "s3_http_retries_total",
+                                            "method" => method_label(&method),
+                                            "reason" => "transport"
+                                        )
+                                        .increment(1);
+                                        let delay = backoff_delay(self.retry, attempt);
+                                        tokio::time::sleep(delay).await;
+                                        continue;
+                                    }
+                                    return Err(map_reqx_error("request failed", err));
+                                }
+                            };
+                            if let Some(err) =
+                                response_service_error(resp.status(), resp.headers(), &resp.text_lossy())
+                            {
+                                if attempt < max_attempts && err.is_retryable() {
+                                    #[cfg(feature = "metrics")]
+                                    metrics::counter!(
+                                        "s3_http_retries_total",
+                                        "method" => method_label(&method),
+                                        "reason" => "service"
+                                    )
+                                    .increment(1);
+                                    let delay = backoff_delay(self.retry, attempt);
+                                    tokio::time::sleep(delay).await;
+                                    continue;
+                                }
+                                if resp.status().is_success() {
+                                    return Err(err);
+                                }
                             }
                             return Ok(AsyncResponse::from_reqx(resp));
                         }
@@ -284,13 +349,22 @@ impl AsyncTransport {
     ) -> Result<reqx::ResponseStream> {
         match body {
             body @ AsyncBody::Stream { .. } => {
-                let req = self.build_request(&method, url, headers, body)?;
-                req.send_stream()
+                let req = self.build_request(&method, url.clone(), headers, body)?;
+                let resp = req
+                    .send_stream()
                     .await
-                    .map_err(|err| map_reqx_error("request failed", err))
+                    .map_err(|err| map_reqx_error("request failed", err))?;
+                if followed_redirect(&url, resp.uri()) {
+                    return Err(unexpected_redirect_error(&method, &url, resp.uri()));
+                }
+                Ok(resp)
             }
             replayable => {
-                let max_attempts = self.retry.max_attempts;
+                let max_attempts = if is_retryable_method(&method) {
+                    self.retry.max_attempts
+                } else {
+                    1
+                };
                 for attempt in 1..=max_attempts {
                     let current_body = replayable
                         .clone_for_retry()
@@ -300,6 +374,9 @@ impl AsyncTransport {
 
                     match req.send_stream().await {
                         Ok(resp) => {
+                            if followed_redirect(&url, resp.uri()) {
+                                return Err(unexpected_redirect_error(&method, &url, resp.uri()));
+                            }
                             if should_retry_status(resp.status()) && attempt < max_attempts {
                                 let delay = retry_delay_from_response(
                                     self.retry,
@@ -336,6 +413,10 @@ impl AsyncTransport {
         headers: HeaderMap,
         body: AsyncBody,
     ) -> Result<reqx::RequestBuilder<'_>> {
+        if matches!(*method, Method::GET | Method::HEAD | Method::DELETE) {
+            ensure_empty_body(&body)?;
+        }
+
         let mut req = self
             .client
             .request(method.clone(), url.as_str().to_string())
@@ -390,20 +471,6 @@ fn retry_delay_from_response(
     backoff_delay(config, attempt)
 }
 
-fn should_retry_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
-fn should_retry_error(err: &reqx::Error) -> bool {
-    matches!(
-        err,
-        reqx::Error::Transport { .. }
-            | reqx::Error::Timeout { .. }
-            | reqx::Error::DeadlineExceeded { .. }
-            | reqx::Error::ReadBody { .. }
-    )
-}
-
 fn default_tls_backend() -> reqx::TlsBackend {
     #[cfg(feature = "rustls")]
     {
@@ -448,6 +515,15 @@ fn method_label(method: &Method) -> &'static str {
 
 fn default_user_agent() -> String {
     format!("s3/{}", env!("CARGO_PKG_VERSION"))
+}
+
+fn ensure_empty_body(body: &AsyncBody) -> Result<()> {
+    match body {
+        AsyncBody::Empty => Ok(()),
+        AsyncBody::Bytes(_) | AsyncBody::Stream { .. } => Err(Error::invalid_config(
+            "this operation does not accept a request body",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -793,9 +869,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_does_not_retry_on_retryable_status_for_non_idempotent_post() -> Result<()> {
+        let (addr, handle, hits) = spawn_test_server(vec![
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ])?;
+
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+        };
+        let transport = AsyncTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let resp = transport
+            .send(
+                Method::POST,
+                url,
+                HeaderMap::new(),
+                AsyncBody::Bytes(Bytes::from_static(b"hello")),
+            )
+            .await?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn send_retries_on_transport_error_for_replayable_body() -> Result<()> {
         let (addr, handle, hits) = spawn_test_server(vec![
             Vec::new(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ])?;
+
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+        };
+        let transport = AsyncTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let resp = transport
+            .send(Method::GET, url, HeaderMap::new(), AsyncBody::Empty)
+            .await?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_retries_when_buffered_body_read_fails() -> Result<()> {
+        let (addr, handle, hits) = spawn_test_server(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabc".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ])?;
+
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+        };
+        let transport = AsyncTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let resp = transport
+            .send(Method::GET, url, HeaderMap::new(), AsyncBody::Empty)
+            .await?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_retries_on_embedded_retryable_service_error_xml() -> Result<()> {
+        let error_xml =
+            "<Error><Code>InternalError</Code><Message>backend failure</Message></Error>";
+        let first = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            error_xml.len(),
+            error_xml
+        )
+        .into_bytes();
+        let (addr, handle, hits) = spawn_test_server(vec![
+            first,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ])?;
+
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+        };
+        let transport = AsyncTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let resp = transport
+            .send(Method::GET, url, HeaderMap::new(), AsyncBody::Empty)
+            .await?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_retries_on_retryable_service_error_code_from_4xx_body() -> Result<()> {
+        let error_xml = "<Error><Code>SlowDown</Code><Message>slow down</Message></Error>";
+        let first = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            error_xml.len(),
+            error_xml
+        )
+        .into_bytes();
+        let (addr, handle, hits) = spawn_test_server(vec![
+            first,
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         ])?;
 
@@ -860,6 +1089,35 @@ mod tests {
 
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_rejects_body_for_get() -> Result<()> {
+        let transport = AsyncTransport::new(
+            RetryConfig::default(),
+            None,
+            Some(Duration::from_secs(1)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse("http://127.0.0.1:9/")
+            .map_err(|_| Error::invalid_config("invalid test URL"))?;
+
+        let err = transport
+            .send(
+                Method::GET,
+                url,
+                HeaderMap::new(),
+                AsyncBody::Bytes(Bytes::from_static(b"body")),
+            )
+            .await
+            .expect_err("GET body should be rejected");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("does not accept a request body"));
+            }
+            other => panic!("expected invalid config, got {other:?}"),
+        }
         Ok(())
     }
 
@@ -1010,5 +1268,41 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_does_not_succeed_after_query_only_redirect() -> Result<()> {
+        let (addr, handle, hits) = spawn_test_server(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: /?next=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ])?;
+
+        let transport = AsyncTransport::new(
+            RetryConfig::default(),
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let outcome = transport
+            .send(Method::GET, url, HeaderMap::new(), AsyncBody::Empty)
+            .await;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        let resp = outcome?;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        Ok(())
+    }
+
+    #[test]
+    fn followed_redirect_treats_unparseable_different_uri_as_redirect() {
+        let request_url = Url::parse("https://example.com/path?x=1").expect("valid URL");
+        assert!(!followed_redirect(&request_url, request_url.as_str()));
+        assert!(followed_redirect(&request_url, "not-a-valid-uri"));
     }
 }

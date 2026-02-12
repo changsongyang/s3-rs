@@ -157,11 +157,31 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::RateLimited { .. } => true,
-            Self::Api { status, .. } => status.is_server_error(),
+            Self::Api { status, code, .. } => {
+                status.is_server_error()
+                    || code.as_deref().is_some_and(is_retryable_service_error_code)
+            }
             Self::Transport { .. } => true,
             Self::InvalidConfig { .. } | Self::Signing { .. } | Self::Decode { .. } => false,
         }
     }
+}
+
+fn is_retryable_service_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "RequestTimeout"
+            | "RequestTimeoutException"
+            | "Throttling"
+            | "ThrottlingException"
+            | "ThrottledException"
+            | "TooManyRequestsException"
+            | "RequestLimitExceeded"
+            | "SlowDown"
+            | "InternalError"
+            | "InternalFailure"
+            | "ServiceUnavailable"
+    )
 }
 
 fn format_optional_field(label: &str, value: &Option<String>) -> String {
@@ -226,5 +246,36 @@ impl StdError for Error {
             | Self::RateLimited { .. }
             | Self::Api { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_error_retryability_can_be_driven_by_service_code() {
+        let err = Error::Api {
+            status: StatusCode::OK,
+            code: Some("InternalError".to_string()),
+            message: Some("backend failure".to_string()),
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn api_error_with_non_retryable_code_and_2xx_status_is_not_retryable() {
+        let err = Error::Api {
+            status: StatusCode::OK,
+            code: Some("AccessDenied".to_string()),
+            message: Some("denied".to_string()),
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        };
+        assert!(!err.is_retryable());
     }
 }

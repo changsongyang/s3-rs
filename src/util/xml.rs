@@ -9,7 +9,65 @@ pub(crate) fn parse_error_xml(body: &str) -> Option<types::XmlError> {
         return None;
     }
 
-    quick_xml::de::from_str::<types::XmlError>(body).ok()
+    let fragment = extract_error_fragment(body)?;
+    let mut parsed = quick_xml::de::from_str::<types::XmlError>(fragment).ok()?;
+    if parsed.request_id.is_none() {
+        parsed.request_id = extract_tag_text(body, "RequestId");
+    }
+    if parsed.host_id.is_none() {
+        parsed.host_id = extract_tag_text(body, "HostId");
+    }
+    normalize_error_fields(parsed)
+}
+
+fn extract_error_fragment(body: &str) -> Option<&str> {
+    let start = find_error_start(body)?;
+    let open_end = body[start..].find('>')? + start;
+    let close_start = body[open_end + 1..].find("</Error>")? + open_end + 1;
+    let close_end = close_start + "</Error>".len();
+    body.get(start..close_end)
+}
+
+fn find_error_start(body: &str) -> Option<usize> {
+    body.find("<Error>")
+        .or_else(|| body.find("<Error "))
+        .or_else(|| body.find("<Error\n"))
+        .or_else(|| body.find("<Error\r"))
+        .or_else(|| body.find("<Error\t"))
+}
+
+fn extract_tag_text(body: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    let value = body.get(start..end)?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn normalize_error_fields(mut error: types::XmlError) -> Option<types::XmlError> {
+    trim_optional_string(&mut error.code);
+    trim_optional_string(&mut error.message);
+    trim_optional_string(&mut error.request_id);
+    trim_optional_string(&mut error.host_id);
+
+    if error.code.is_none() && error.message.is_none() {
+        return None;
+    }
+
+    Some(error)
+}
+
+fn trim_optional_string(value: &mut Option<String>) {
+    let trimmed = value
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+    *value = trimmed;
 }
 
 pub(crate) fn parse_list_objects_v2(body: &str) -> Result<types::ListObjectsV2Output, Error> {
@@ -764,6 +822,34 @@ mod tests {
         );
         assert_eq!(err.request_id.as_deref(), Some("req-123"));
         assert_eq!(err.host_id.as_deref(), Some("host-456"));
+    }
+
+    #[test]
+    fn parses_wrapped_error_response_xml() {
+        let xml = r#"
+<ErrorResponse>
+  <Error>
+    <Code>AccessDenied</Code>
+    <Message>Access denied</Message>
+  </Error>
+  <RequestId>req-outer</RequestId>
+</ErrorResponse>
+"#;
+
+        let err = parse_error_xml(xml).expect("wrapped error response should parse");
+        assert_eq!(err.code.as_deref(), Some("AccessDenied"));
+        assert_eq!(err.message.as_deref(), Some("Access denied"));
+        assert_eq!(err.request_id.as_deref(), Some("req-outer"));
+    }
+
+    #[test]
+    fn ignores_non_error_xml_root() {
+        let xml = r#"
+<ListBucketResult>
+  <Name>bucket-a</Name>
+</ListBucketResult>
+"#;
+        assert!(parse_error_xml(xml).is_none());
     }
 
     #[test]

@@ -302,10 +302,31 @@ where
     }
 
     fn can_attempt_refresh(&self, state: &CachedState, now: std::time::Instant) -> bool {
-        match state.last_refresh_attempt {
-            Some(last) => now.duration_since(last) >= self.min_refresh_interval,
-            None => true,
+        self.refresh_throttle_remaining(state, now).is_none()
+    }
+
+    fn refresh_throttle_remaining(
+        &self,
+        state: &CachedState,
+        now: std::time::Instant,
+    ) -> Option<Duration> {
+        let last = state.last_refresh_attempt?;
+        let elapsed = now.saturating_duration_since(last);
+        if elapsed >= self.min_refresh_interval {
+            None
+        } else {
+            Some(self.min_refresh_interval - elapsed)
         }
+    }
+
+    fn throttled_refresh_error(retry_after: Duration) -> Error {
+        Error::transport(
+            format!(
+                "credentials refresh throttled; retry after {}ms",
+                retry_after.as_millis()
+            ),
+            None,
+        )
     }
 
     #[cfg(feature = "blocking")]
@@ -328,13 +349,22 @@ where
                     {
                         return Ok(cached.clone());
                     }
-                } else if !self.can_attempt_refresh(&state, Instant::now()) {
-                    // No cached credentials and we're throttled; keep waiting.
                 }
 
                 if state.refreshing {
                     (state.cached.clone(), false, true)
                 } else {
+                    let has_usable_fallback = state
+                        .cached
+                        .as_ref()
+                        .is_some_and(|cached| !Self::is_expired(cached, now_utc));
+                    if !force
+                        && !has_usable_fallback
+                        && let Some(retry_after) =
+                            self.refresh_throttle_remaining(&state, Instant::now())
+                    {
+                        return Err(Self::throttled_refresh_error(retry_after));
+                    }
                     state.refreshing = true;
                     state.last_refresh_attempt = Some(Instant::now());
                     (state.cached.clone(), true, false)
@@ -367,7 +397,8 @@ where
                     return Ok(snapshot);
                 }
                 Err(err) => {
-                    let fallback = fallback.filter(|s| !Self::is_expired(s, now_utc));
+                    let fallback_now = OffsetDateTime::now_utc();
+                    let fallback = fallback.filter(|s| !Self::is_expired(s, fallback_now));
                     drop(state);
                     self.condvar.notify_all();
                     #[cfg(feature = "async")]
@@ -407,6 +438,17 @@ where
                     let notified = self.notify.notified();
                     (state.cached.clone(), Some(notified))
                 } else {
+                    let has_usable_fallback = state
+                        .cached
+                        .as_ref()
+                        .is_some_and(|cached| !Self::is_expired(cached, now_utc));
+                    if !force
+                        && !has_usable_fallback
+                        && let Some(retry_after) =
+                            self.refresh_throttle_remaining(&state, Instant::now())
+                    {
+                        return Err(Self::throttled_refresh_error(retry_after));
+                    }
                     state.refreshing = true;
                     state.last_refresh_attempt = Some(Instant::now());
                     (state.cached.clone(), None)
@@ -431,7 +473,8 @@ where
                     return Ok(snapshot);
                 }
                 Err(err) => {
-                    let fallback = fallback.filter(|s| !Self::is_expired(s, now_utc));
+                    let fallback_now = OffsetDateTime::now_utc();
+                    let fallback = fallback.filter(|s| !Self::is_expired(s, fallback_now));
                     drop(state);
                     self.condvar.notify_all();
                     self.notify.notify_waiters();
@@ -946,6 +989,28 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct DelayedFailProvider {
+        delay: Duration,
+    }
+
+    impl CredentialsProvider for DelayedFailProvider {
+        #[cfg(feature = "async")]
+        fn credentials_async(&self) -> CredentialsFuture<'_> {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Err(Error::transport("refresh failed", None))
+            })
+        }
+
+        #[cfg(feature = "blocking")]
+        fn credentials_blocking(&self) -> Result<CredentialsSnapshot> {
+            std::thread::sleep(self.delay);
+            Err(Error::transport("refresh failed", None))
+        }
+    }
+
+    #[derive(Debug)]
     struct CountingOkProvider {
         calls: Arc<AtomicUsize>,
         expires_in: time::Duration,
@@ -1133,6 +1198,49 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn cached_provider_throttles_failed_refresh_without_cache_async() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inner = CountingFailProvider {
+            calls: calls.clone(),
+        };
+        let cached = CachedProvider::new(inner).min_refresh_interval(Duration::from_secs(60));
+
+        let first = cached.credentials_async().await;
+        assert!(first.is_err(), "initial refresh should fail");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second = cached.credentials_async().await;
+        match second {
+            Err(Error::Transport { message, .. }) => {
+                assert!(message.contains("credentials refresh throttled"));
+            }
+            other => panic!("expected throttled transport error, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn cached_provider_does_not_return_expired_stale_after_slow_failed_refresh_async() {
+        let initial =
+            CredentialsSnapshot::new(Credentials::new("AKIA_TEST", "SECRET_TEST").unwrap())
+                .with_expires_at(OffsetDateTime::now_utc() + time::Duration::milliseconds(20));
+        let cached = CachedProvider::new(DelayedFailProvider {
+            delay: Duration::from_millis(120),
+        })
+        .min_refresh_interval(Duration::from_secs(0))
+        .with_initial(initial);
+
+        match cached.credentials_async().await {
+            Err(Error::Transport { message, .. }) => {
+                assert!(message.contains("refresh failed"));
+            }
+            other => panic!("expected refresh failure, got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "blocking")]
     #[test]
     fn cached_provider_returns_stale_on_refresh_error_blocking() {
@@ -1293,5 +1401,48 @@ mod tests {
             first.credentials().access_key_id,
             second.credentials().access_key_id
         );
+    }
+
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn cached_provider_throttles_failed_refresh_without_cache_blocking() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inner = CountingFailProvider {
+            calls: calls.clone(),
+        };
+        let cached = CachedProvider::new(inner).min_refresh_interval(Duration::from_secs(60));
+
+        let first = cached.credentials_blocking();
+        assert!(first.is_err(), "initial refresh should fail");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second = cached.credentials_blocking();
+        match second {
+            Err(Error::Transport { message, .. }) => {
+                assert!(message.contains("credentials refresh throttled"));
+            }
+            other => panic!("expected throttled transport error, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn cached_provider_does_not_return_expired_stale_after_slow_failed_refresh_blocking() {
+        let initial =
+            CredentialsSnapshot::new(Credentials::new("AKIA_TEST", "SECRET_TEST").unwrap())
+                .with_expires_at(OffsetDateTime::now_utc() + time::Duration::milliseconds(20));
+        let cached = CachedProvider::new(DelayedFailProvider {
+            delay: Duration::from_millis(120),
+        })
+        .min_refresh_interval(Duration::from_secs(0))
+        .with_initial(initial);
+
+        match cached.credentials_blocking() {
+            Err(Error::Transport { message, .. }) => {
+                assert!(message.contains("refresh failed"));
+            }
+            other => panic!("expected refresh failure, got {other:?}"),
+        }
     }
 }

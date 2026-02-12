@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
+use super::common::create_bucket_location_constraint;
 use super::blocking_common::read_body_string;
 
 use crate::{
@@ -337,7 +338,9 @@ impl BlockingCreateBucketRequest {
     /// Sends the request.
     pub fn send(self) -> Result<CreateBucketOutput> {
         let mut headers = HeaderMap::new();
-        let body = match self.location_constraint {
+        let location_constraint =
+            create_bucket_location_constraint(self.location_constraint, self.client.region());
+        let body = match location_constraint {
             Some(region) => {
                 let body = crate::util::xml::encode_create_bucket_configuration(&region)?;
                 headers.insert(

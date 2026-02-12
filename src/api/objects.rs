@@ -6,6 +6,8 @@ use bytes::Bytes;
 use futures_core::Stream;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
+use super::common::parse_xml_or_service_error;
+
 use crate::{
     client::Client,
     error::{Error, Result},
@@ -888,11 +890,15 @@ impl CopyObjectRequest {
             return Err(response_error(resp).await);
         }
 
+        let status = resp.status();
+        let response_headers = resp.headers().clone();
         let xml = resp
             .text()
             .await
             .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_copy_object(&xml)
+        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
+            crate::util::xml::parse_copy_object(body)
+        })
     }
 }
 
@@ -957,11 +963,15 @@ impl CreateMultipartUploadRequest {
             return Err(response_error(resp).await);
         }
 
+        let status = resp.status();
+        let response_headers = resp.headers().clone();
         let xml = resp
             .text()
             .await
             .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_create_multipart_upload(&xml)
+        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
+            crate::util::xml::parse_create_multipart_upload(body)
+        })
     }
 }
 
@@ -998,6 +1008,8 @@ impl UploadPartRequest {
 
     /// Sends the request.
     pub async fn send(self) -> Result<UploadPartOutput> {
+        validate_upload_part_body(&self.body)?;
+
         let query = vec![
             ("partNumber".to_string(), self.part_number.to_string()),
             ("uploadId".to_string(), self.upload_id),
@@ -1023,6 +1035,14 @@ impl UploadPartRequest {
             etag: crate::util::headers::header_string(resp.headers(), http::header::ETAG),
         })
     }
+}
+
+#[cfg(feature = "multipart")]
+fn validate_upload_part_body(body: &AsyncBody) -> Result<()> {
+    if matches!(body, AsyncBody::Empty) {
+        return Err(Error::invalid_config("upload_part requires a request body"));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "multipart")]
@@ -1093,11 +1113,15 @@ impl UploadPartCopyRequest {
             return Err(response_error(resp).await);
         }
 
+        let status = resp.status();
+        let response_headers = resp.headers().clone();
         let xml = resp
             .text()
             .await
             .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_upload_part_copy(&xml)
+        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
+            crate::util::xml::parse_upload_part_copy(body)
+        })
     }
 }
 
@@ -1156,11 +1180,15 @@ impl CompleteMultipartUploadRequest {
             return Err(response_error(resp).await);
         }
 
+        let status = resp.status();
+        let response_headers = resp.headers().clone();
         let xml = resp
             .text()
             .await
             .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_complete_multipart_upload(&xml)
+        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
+            crate::util::xml::parse_complete_multipart_upload(body)
+        })
     }
 }
 
@@ -1248,11 +1276,15 @@ impl ListPartsRequest {
             return Err(response_error(resp).await);
         }
 
+        let status = resp.status();
+        let response_headers = resp.headers().clone();
         let xml = resp
             .text()
             .await
             .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_list_parts(&xml)
+        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
+            crate::util::xml::parse_list_parts(body)
+        })
     }
 }
 
@@ -1749,5 +1781,71 @@ impl PresignDeleteObjectRequest {
                 self.headers,
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_xml_or_service_error_maps_error_xml_as_api_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-request-id", HeaderValue::from_static("req-1"));
+        let body = r#"
+<Error>
+  <Code>InternalError</Code>
+  <Message>backend failure</Message>
+</Error>
+"#;
+
+        let err = parse_xml_or_service_error::<()>(StatusCode::OK, &headers, body, |_xml| {
+            Err(Error::decode("failed to parse success XML", None))
+        })
+        .expect_err("expected service error mapping");
+
+        match err {
+            Error::Api {
+                status,
+                code,
+                message,
+                request_id,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(code.as_deref(), Some("InternalError"));
+                assert_eq!(message.as_deref(), Some("backend failure"));
+                assert_eq!(request_id.as_deref(), Some("req-1"));
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_xml_or_service_error_preserves_decode_error_for_plain_body() {
+        let err = parse_xml_or_service_error::<()>(
+            StatusCode::OK,
+            &HeaderMap::new(),
+            "not-xml",
+            |_xml| Err(Error::decode("failed to parse success XML", None)),
+        )
+        .expect_err("expected parse failure");
+
+        match err {
+            Error::Decode { .. } => {}
+            other => panic!("expected Decode error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn validate_upload_part_body_rejects_empty() {
+        let err = validate_upload_part_body(&AsyncBody::Empty).expect_err("expected invalid body");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("upload_part requires a request body"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
     }
 }

@@ -71,6 +71,10 @@ impl Client {
         api::BucketsService::new(self.clone())
     }
 
+    pub(crate) fn region(&self) -> &str {
+        self.inner.region.as_str()
+    }
+
     pub(crate) async fn execute(
         &self,
         method: Method,

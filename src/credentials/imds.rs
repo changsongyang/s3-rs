@@ -45,6 +45,89 @@ fn parse_expiration(value: &str) -> Result<OffsetDateTime, Error> {
     })
 }
 
+fn parse_container_credentials_full_uri(value: &str) -> Result<url::Url, Error> {
+    let uri = url::Url::parse(value)
+        .map_err(|_| Error::invalid_config("AWS_CONTAINER_CREDENTIALS_FULL_URI is invalid"))?;
+    let scheme = uri.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI must use http or https",
+        ));
+    }
+
+    if uri.host_str().is_none() {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI must include host",
+        ));
+    }
+
+    if scheme == "http" && !is_allowed_http_container_credentials_host(&uri) {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI with http must target a loopback or 169.254.170.2 host",
+        ));
+    }
+
+    Ok(uri)
+}
+
+fn parse_container_credentials_relative_uri(value: &str) -> Result<String, Error> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must not be empty",
+        ));
+    }
+    if !value.starts_with('/') {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must start with '/'",
+        ));
+    }
+
+    let full = format!("http://169.254.170.2{value}");
+    let uri = url::Url::parse(&full)
+        .map_err(|_| Error::invalid_config("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI is invalid"))?;
+    if uri.host_str() != Some("169.254.170.2") {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI resolved to an unexpected host",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn is_allowed_http_container_credentials_host(uri: &url::Url) -> bool {
+    let Some(host) = uri.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") || host == "169.254.170.2" {
+        return true;
+    }
+
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn imds_v1_disabled_value(value: &str) -> bool {
+    let value = value.trim();
+    value == "1" || value.eq_ignore_ascii_case("true")
+}
+
+fn imds_v1_fallback_allowed() -> bool {
+    !std::env::var("AWS_EC2_METADATA_V1_DISABLED")
+        .ok()
+        .as_deref()
+        .is_some_and(imds_v1_disabled_value)
+}
+
+fn should_fallback_to_imds_v1_from_token_error(err: &Error) -> bool {
+    matches!(
+        err.status(),
+        Some(http::StatusCode::FORBIDDEN)
+            | Some(http::StatusCode::NOT_FOUND)
+            | Some(http::StatusCode::METHOD_NOT_ALLOWED)
+    )
+}
+
 #[cfg(feature = "async")]
 pub(crate) async fn load_async(
     tls_root_store: reqx::TlsRootStore,
@@ -57,8 +140,9 @@ pub(crate) async fn load_async(
         .ok()
         .filter(|v| !v.is_empty())
     {
+        let full = parse_container_credentials_full_uri(&full)?;
         let headers = container_auth_headers()?;
-        let body = http_get_text(&client, &full, headers).await?;
+        let body = http_get_text(&client, full.as_str(), headers).await?;
         let parsed: MetadataCredentials = serde_json::from_str(&body).map_err(|e| {
             Error::decode(
                 "failed to parse container credentials JSON",
@@ -72,6 +156,7 @@ pub(crate) async fn load_async(
         .ok()
         .filter(|v| !v.is_empty())
     {
+        let rel = parse_container_credentials_relative_uri(&rel)?;
         let url = format!("http://169.254.170.2{rel}");
         let headers = container_auth_headers()?;
         let body = http_get_text(&client, &url, headers).await?;
@@ -84,7 +169,15 @@ pub(crate) async fn load_async(
         return parsed.into_snapshot();
     }
 
-    let token = fetch_imds_v2_token(&client).await.ok();
+    let token = match fetch_imds_v2_token(&client).await {
+        Ok(token) => Some(token),
+        Err(err)
+            if imds_v1_fallback_allowed() && should_fallback_to_imds_v1_from_token_error(&err) =>
+        {
+            None
+        }
+        Err(err) => return Err(err),
+    };
     let mut headers = http::HeaderMap::new();
     if let Some(token) = token.as_deref().filter(|v| !v.is_empty()) {
         let value = http::HeaderValue::from_str(token)
@@ -203,8 +296,9 @@ pub(crate) fn load_blocking(
         .ok()
         .filter(|v| !v.is_empty())
     {
+        let full = parse_container_credentials_full_uri(&full)?;
         let headers = container_auth_headers_blocking()?;
-        let body = http_get_text_blocking(&client, &full, &headers)?;
+        let body = http_get_text_blocking(&client, full.as_str(), &headers)?;
         let parsed: MetadataCredentials = serde_json::from_str(&body).map_err(|e| {
             Error::decode(
                 "failed to parse container credentials JSON",
@@ -218,6 +312,7 @@ pub(crate) fn load_blocking(
         .ok()
         .filter(|v| !v.is_empty())
     {
+        let rel = parse_container_credentials_relative_uri(&rel)?;
         let url = format!("http://169.254.170.2{rel}");
         let headers = container_auth_headers_blocking()?;
         let body = http_get_text_blocking(&client, &url, &headers)?;
@@ -230,7 +325,15 @@ pub(crate) fn load_blocking(
         return parsed.into_snapshot();
     }
 
-    let token = fetch_imds_v2_token_blocking(&client).ok();
+    let token = match fetch_imds_v2_token_blocking(&client) {
+        Ok(token) => Some(token),
+        Err(err)
+            if imds_v1_fallback_allowed() && should_fallback_to_imds_v1_from_token_error(&err) =>
+        {
+            None
+        }
+        Err(err) => return Err(err),
+    };
     let mut headers = http::HeaderMap::new();
     if let Some(token) = token.as_deref().filter(|v| !v.is_empty()) {
         let value = http::HeaderValue::from_str(token)
@@ -510,6 +613,106 @@ mod tests {
             snapshot.expires_at(),
             Some(parse_expiration("2020-01-01T00:00:00Z").unwrap())
         );
+    }
+
+    #[test]
+    fn parse_container_credentials_full_uri_rejects_non_local_http_host() {
+        let err = parse_container_credentials_full_uri("http://example.com/creds")
+            .expect_err("non-local http host must be rejected");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("must target a loopback or 169.254.170.2 host"));
+            }
+            other => panic!("expected invalid config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_container_credentials_full_uri_accepts_allowed_hosts() {
+        assert!(
+            parse_container_credentials_full_uri("http://169.254.170.2/creds").is_ok(),
+            "ECS task role endpoint should be accepted",
+        );
+        assert!(
+            parse_container_credentials_full_uri("http://127.0.0.1/creds").is_ok(),
+            "loopback endpoint should be accepted",
+        );
+        assert!(
+            parse_container_credentials_full_uri("https://example.com/creds").is_ok(),
+            "https endpoint should be accepted",
+        );
+    }
+
+    #[test]
+    fn parse_container_credentials_relative_uri_rejects_missing_leading_slash() {
+        let err = parse_container_credentials_relative_uri("v2/credentials/abc")
+            .expect_err("relative URI must start with slash");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("must start with '/'"));
+            }
+            other => panic!("expected invalid config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_container_credentials_relative_uri_accepts_valid_path() {
+        let parsed = parse_container_credentials_relative_uri("/v2/credentials/abc")
+            .expect("valid relative URI should pass");
+        assert_eq!(parsed, "/v2/credentials/abc");
+    }
+
+    #[test]
+    fn imds_v1_disabled_value_parsing_matches_expected_inputs() {
+        assert!(imds_v1_disabled_value("true"));
+        assert!(imds_v1_disabled_value("TRUE"));
+        assert!(imds_v1_disabled_value("1"));
+        assert!(!imds_v1_disabled_value("false"));
+        assert!(!imds_v1_disabled_value("0"));
+        assert!(!imds_v1_disabled_value("yes"));
+    }
+
+    #[test]
+    fn imds_v1_fallback_only_allows_specific_token_error_statuses() {
+        let allowed = [
+            http::StatusCode::FORBIDDEN,
+            http::StatusCode::NOT_FOUND,
+            http::StatusCode::METHOD_NOT_ALLOWED,
+        ];
+        for status in allowed {
+            let err = Error::Api {
+                status,
+                code: None,
+                message: None,
+                request_id: None,
+                host_id: None,
+                body_snippet: None,
+            };
+            assert!(should_fallback_to_imds_v1_from_token_error(&err));
+        }
+
+        let denied = [
+            http::StatusCode::BAD_REQUEST,
+            http::StatusCode::UNAUTHORIZED,
+            http::StatusCode::TOO_MANY_REQUESTS,
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+        ];
+        for status in denied {
+            let err = Error::Api {
+                status,
+                code: None,
+                message: None,
+                request_id: None,
+                host_id: None,
+                body_snippet: None,
+            };
+            assert!(!should_fallback_to_imds_v1_from_token_error(&err));
+        }
+
+        assert!(!should_fallback_to_imds_v1_from_token_error(&Error::transport(
+            "network timeout",
+            None,
+        )));
     }
 
     #[cfg(feature = "async")]

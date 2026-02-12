@@ -30,8 +30,6 @@ cargo add s3 --no-default-features --features blocking,rustls
 cargo add s3 --no-default-features --features async,native-tls
 ```
 
-MSRV: Rust `1.92`.
-
 ## Usage
 
 ### Async

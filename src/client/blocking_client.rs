@@ -71,6 +71,10 @@ impl BlockingClient {
         api::BlockingBucketsService::new(self.clone())
     }
 
+    pub(crate) fn region(&self) -> &str {
+        self.inner.region.as_str()
+    }
+
     pub(crate) fn execute(
         &self,
         method: Method,

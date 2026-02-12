@@ -5,6 +5,11 @@ pub(crate) mod async_transport;
 #[cfg(feature = "blocking")]
 pub(crate) mod blocking_transport;
 
+#[cfg(any(feature = "async", feature = "blocking"))]
+use http::{Method, StatusCode};
+#[cfg(any(feature = "async", feature = "blocking"))]
+use url::Url;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RetryConfig {
     pub(crate) max_attempts: u32,
@@ -122,6 +127,24 @@ pub(crate) fn response_error_from_status(
 }
 
 #[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn response_service_error(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    body: &str,
+) -> Option<crate::error::Error> {
+    let parsed = crate::util::xml::parse_error_xml(body)?;
+    if parsed.code.is_none()
+        && parsed.message.is_none()
+        && parsed.request_id.is_none()
+        && parsed.host_id.is_none()
+    {
+        return None;
+    }
+
+    Some(response_error_from_status(status, headers, body))
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
 pub(crate) fn map_reqx_error(message: &str, err: reqx::Error) -> crate::error::Error {
     match err {
         reqx::Error::HttpStatus {
@@ -140,6 +163,66 @@ pub(crate) fn map_reqx_error(message: &str, err: reqx::Error) -> crate::error::E
         ),
         other => crate::error::Error::transport(message, Some(Box::new(other))),
     }
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn should_retry_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn should_retry_error(err: &reqx::Error) -> bool {
+    matches!(
+        err,
+        reqx::Error::Transport { .. }
+            | reqx::Error::Timeout { .. }
+            | reqx::Error::DeadlineExceeded { .. }
+            | reqx::Error::ReadBody { .. }
+    )
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn is_retryable_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn followed_redirect(request_url: &Url, response_uri: &str) -> bool {
+    if response_uri == request_url.as_str() {
+        return false;
+    }
+
+    let Ok(response_url) = Url::parse(response_uri) else {
+        // Treat an unparseable-but-different URI as suspicious to avoid returning
+        // silently redirected successes.
+        return true;
+    };
+
+    request_url.scheme() != response_url.scheme()
+        || request_url.username() != response_url.username()
+        || request_url.password() != response_url.password()
+        || request_url.host_str() != response_url.host_str()
+        || request_url.port_or_known_default() != response_url.port_or_known_default()
+        || request_url.path() != response_url.path()
+        || request_url.query() != response_url.query()
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn unexpected_redirect_error(
+    method: &Method,
+    request_url: &Url,
+    response_uri: &str,
+) -> crate::error::Error {
+    crate::error::Error::transport(
+        format!(
+            "unexpected redirect followed for {method} {} -> {response_uri}",
+            request_url.as_str()
+        ),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -290,6 +373,51 @@ mod tests {
             }
             other => panic!("expected RateLimited for 429, got {other:?}"),
         }
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn response_service_error_detects_embedded_service_error_xml() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-request-id",
+            http::HeaderValue::from_static("req-success-xml"),
+        );
+        let body = r#"<Error><Code>InternalError</Code><Message>backend failure</Message></Error>"#;
+
+        let err = response_service_error(http::StatusCode::OK, &headers, body)
+            .expect("expected embedded error to be detected");
+        match err {
+            crate::error::Error::Api {
+                status,
+                code,
+                request_id,
+                ..
+            } => {
+                assert_eq!(status, http::StatusCode::OK);
+                assert_eq!(code.as_deref(), Some("InternalError"));
+                assert_eq!(request_id.as_deref(), Some("req-success-xml"));
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn response_service_error_ignores_non_error_success_body() {
+        assert!(
+            response_service_error(http::StatusCode::OK, &http::HeaderMap::new(), "<ListBucketResult/>")
+                .is_none()
+        );
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn response_service_error_preserves_retryable_service_code_on_4xx() {
+        let body = r#"<Error><Code>SlowDown</Code><Message>slow down</Message></Error>"#;
+        let err = response_service_error(http::StatusCode::BAD_REQUEST, &http::HeaderMap::new(), body)
+            .expect("expected embedded service error");
+        assert!(err.is_retryable());
     }
 
     #[cfg(all(

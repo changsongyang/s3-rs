@@ -6,6 +6,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
 use super::blocking_common::read_body_string;
+use super::common::parse_xml_or_service_error;
 
 use crate::{
     client::BlockingClient,
@@ -824,9 +825,11 @@ impl BlockingCopyObjectRequest {
             return Err(response_error(parts.status, &parts.headers, &body));
         }
 
-        let (_, body) = resp.into_parts();
+        let (parts, body) = resp.into_parts();
         let xml = read_body_string(body)?;
-        crate::util::xml::parse_copy_object(&xml)
+        parse_xml_or_service_error(parts.status, &parts.headers, &xml, |body| {
+            crate::util::xml::parse_copy_object(body)
+        })
     }
 }
 
@@ -890,9 +893,11 @@ impl BlockingCreateMultipartUploadRequest {
             return Err(response_error(parts.status, &parts.headers, &body));
         }
 
-        let (_, body) = resp.into_parts();
+        let (parts, body) = resp.into_parts();
         let xml = read_body_string(body)?;
-        crate::util::xml::parse_create_multipart_upload(&xml)
+        parse_xml_or_service_error(parts.status, &parts.headers, &xml, |body| {
+            crate::util::xml::parse_create_multipart_upload(body)
+        })
     }
 }
 
@@ -1017,9 +1022,11 @@ impl BlockingUploadPartCopyRequest {
             return Err(response_error(parts.status, &parts.headers, &body));
         }
 
-        let (_, body) = resp.into_parts();
+        let (parts, body) = resp.into_parts();
         let xml = read_body_string(body)?;
-        crate::util::xml::parse_upload_part_copy(&xml)
+        parse_xml_or_service_error(parts.status, &parts.headers, &xml, |body| {
+            crate::util::xml::parse_upload_part_copy(body)
+        })
     }
 }
 
@@ -1077,9 +1084,11 @@ impl BlockingCompleteMultipartUploadRequest {
             return Err(response_error(parts.status, &parts.headers, &body));
         }
 
-        let (_, body) = resp.into_parts();
+        let (parts, body) = resp.into_parts();
         let xml = read_body_string(body)?;
-        crate::util::xml::parse_complete_multipart_upload(&xml)
+        parse_xml_or_service_error(parts.status, &parts.headers, &xml, |body| {
+            crate::util::xml::parse_complete_multipart_upload(body)
+        })
     }
 }
 
@@ -1165,9 +1174,11 @@ impl BlockingListPartsRequest {
             return Err(response_error(parts.status, &parts.headers, &body));
         }
 
-        let (_, body) = resp.into_parts();
+        let (parts, body) = resp.into_parts();
         let xml = read_body_string(body)?;
-        crate::util::xml::parse_list_parts(&xml)
+        parse_xml_or_service_error(parts.status, &parts.headers, &xml, |body| {
+            crate::util::xml::parse_list_parts(body)
+        })
     }
 }
 
@@ -1574,5 +1585,59 @@ impl BlockingPresignDeleteObjectRequest {
             self.query_params,
             self.headers,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_xml_or_service_error_maps_error_xml_as_api_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-request-id", HeaderValue::from_static("req-1"));
+        let body = r#"
+<Error>
+  <Code>InternalError</Code>
+  <Message>backend failure</Message>
+</Error>
+"#;
+
+        let err = parse_xml_or_service_error::<()>(StatusCode::OK, &headers, body, |_xml| {
+            Err(Error::decode("failed to parse success XML", None))
+        })
+        .expect_err("expected service error mapping");
+
+        match err {
+            Error::Api {
+                status,
+                code,
+                message,
+                request_id,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(code.as_deref(), Some("InternalError"));
+                assert_eq!(message.as_deref(), Some("backend failure"));
+                assert_eq!(request_id.as_deref(), Some("req-1"));
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_xml_or_service_error_preserves_decode_error_for_plain_body() {
+        let err = parse_xml_or_service_error::<()>(
+            StatusCode::OK,
+            &HeaderMap::new(),
+            "not-xml",
+            |_xml| Err(Error::decode("failed to parse success XML", None)),
+        )
+        .expect_err("expected parse failure");
+
+        match err {
+            Error::Decode { .. } => {}
+            other => panic!("expected Decode error, got {other:?}"),
+        }
     }
 }

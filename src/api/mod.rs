@@ -8,6 +8,7 @@ mod blocking_common;
 mod blocking_objects;
 #[cfg(feature = "async")]
 mod buckets;
+mod common;
 #[cfg(feature = "async")]
 mod objects;
 
