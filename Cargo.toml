@@ -22,82 +22,62 @@ include = [
   "tests/**"
 ]
 
-[workspace]
-members = ["."]
-resolver = "3"
-
-[workspace.dependencies]
-base64 = { version = "0.22.1", default-features = false, features = ["std"] }
+[dependencies]
+# Core protocol and shared types
 bytes = { version = "1.11.1", default-features = false, features = ["std"] }
-crc = { version = "3.4.0", default-features = false }
-criterion = { version = "0.8.2" }
-futures-core = { version = "0.3.31", default-features = false, features = ["std"] }
-futures-io = { version = "0.3.31", default-features = false, features = ["std"] }
-futures-util = { version = "0.3.31", default-features = false, features = ["std", "io"] }
-hex = { version = "0.4.3", default-features = false, features = ["std"] }
-hmac = { version = "0.12.1", default-features = false, features = ["std"] }
 http = { version = "1.4.0", default-features = false, features = ["std"] }
-http-body-util = { version = "0.1.3", default-features = false }
 httpdate = { version = "1.0.3", default-features = false }
-md-5 = { version = "0.10.6", default-features = false, features = ["std"] }
-metrics = { version = "0.24.3", default-features = false }
-quick-xml = { version = "0.39.0", default-features = false, features = ["serialize"] }
-reqwest = { version = "0.13.2", default-features = false, features = ["stream"] }
-reqx = { version = "0.1.16", default-features = false }
-serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
-sha1 = { version = "0.10.6", default-features = false, features = ["std"] }
-sha2 = { version = "0.10.8", default-features = false, features = ["std"] }
 time = { version = "0.3.47", default-features = false, features = ["std", "parsing"] }
-tokio = { version = "1.49.0", default-features = false, features = ["time", "sync"] }
-tracing = { version = "0.1.44", default-features = false, features = ["std"] }
-ureq = { version = "3.2.0", default-features = false }
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 
-[dependencies]
-base64 = { workspace = true }
-bytes = { workspace = true }
-crc = { workspace = true, optional = true }
-hex = { workspace = true }
-hmac = { workspace = true }
-http = { workspace = true }
-http-body-util = { workspace = true, optional = true }
-httpdate = { workspace = true }
-md-5 = { workspace = true }
-reqx = { workspace = true, optional = true }
-sha1 = { workspace = true, optional = true }
-sha2 = { workspace = true }
-time = { workspace = true }
-url = { workspace = true }
+# SigV4 signing and hashing
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
+hex = { version = "0.4.3", default-features = false, features = ["std"] }
+hmac = { version = "0.12.1", default-features = false, features = ["std"] }
+md-5 = { version = "0.10.6", default-features = false, features = ["std"] }
+sha2 = { version = "0.10.8", default-features = false, features = ["std"] }
 
-# Optional dependencies (features)
-futures-core = { workspace = true, optional = true }
-futures-io = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
-metrics = { workspace = true, optional = true }
-quick-xml = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
+# Transport backend (feature-gated)
+reqx = { version = "0.1.16", default-features = false, optional = true }
+http-body-util = { version = "0.1.3", default-features = false, optional = true }
+
+# XML and data decoding
+quick-xml = { version = "0.39.0", default-features = false, features = ["serialize"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.149", default-features = false, features = ["std"], optional = true }
+
+# Async runtime and stream utils (feature-gated)
+futures-core = { version = "0.3.31", default-features = false, features = ["std"], optional = true }
+futures-io = { version = "0.3.31", default-features = false, features = ["std"], optional = true }
+futures-util = { version = "0.3.31", default-features = false, features = ["std", "io"], optional = true }
+tokio = { version = "1.49.0", default-features = false, features = ["time", "sync"], optional = true }
+
+# Optional capabilities
+crc = { version = "3.4.0", default-features = false, optional = true }
+sha1 = { version = "0.10.6", default-features = false, features = ["std"], optional = true }
+metrics = { version = "0.24.3", default-features = false, optional = true }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
-reqwest = { workspace = true }
-tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "time"] }
-ureq = { workspace = true }
+# Benchmarks
+criterion = { version = "0.8.2" }
+
+# Compatibility and integration tests
+reqwest = { version = "0.13.2", default-features = false, features = ["stream"] }
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+ureq = { version = "3.2.0", default-features = false }
 
 [features]
 default = ["async", "rustls"]
 
 # Core modes
 async = [
-    "dep:reqx",
-    "dep:futures-core",
-    "dep:futures-io",
-    "dep:futures-util",
-    "dep:tokio",
-    "dep:http-body-util",
+  "dep:reqx",
+  "dep:futures-core",
+  "dep:futures-io",
+  "dep:futures-util",
+  "dep:tokio",
+  "dep:http-body-util",
 ]
 blocking = ["dep:reqx"]
 
@@ -115,8 +95,8 @@ credentials-sts = []
 
 # TLS selection
 rustls = [
-    "reqx?/async-tls-rustls-ring",
-    "reqx?/blocking-tls-rustls-ring",
+  "reqx?/async-tls-rustls-ring",
+  "reqx?/blocking-tls-rustls-ring",
 ]
 native-tls = ["reqx?/async-tls-native", "reqx?/blocking-tls-native"]
 
@@ -133,4 +113,4 @@ tag-prefix = ""
 tag-name = "{{prefix}}{{version}}"
 pre-release-commit-message = "chore: release {{crate_name}} version {{version}}"
 tag-message = "chore: release {{crate_name}} version {{version}}"
-pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}" ]
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"]
