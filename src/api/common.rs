@@ -1,4 +1,4 @@
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode};
 
 use crate::error::{Error, Result};
 
@@ -62,6 +62,19 @@ pub(crate) fn validate_subresource(subresource: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn apply_metadata_headers(
+    headers: &mut HeaderMap,
+    metadata: Vec<(String, String)>,
+) -> Result<()> {
+    for (name, value) in metadata {
+        let header_name = crate::util::redact::metadata_header_name(&name)?;
+        let value = HeaderValue::from_str(&value)
+            .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
+        headers.insert(header_name, value);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +124,32 @@ mod tests {
         assert!(validate_subresource("versioning").is_ok());
         assert!(validate_subresource("").is_err());
         assert!(validate_subresource("   ").is_err());
+    }
+
+    #[test]
+    fn apply_metadata_headers_writes_expected_headers() {
+        let mut headers = HeaderMap::new();
+        apply_metadata_headers(
+            &mut headers,
+            vec![
+                ("owner".to_string(), "alice".to_string()),
+                ("trace-id".to_string(), "abc-123".to_string()),
+            ],
+        )
+        .expect("metadata should map to headers");
+
+        assert_eq!(
+            headers
+                .get("x-amz-meta-owner")
+                .and_then(|v| v.to_str().ok()),
+            Some("alice")
+        );
+        assert_eq!(
+            headers
+                .get("x-amz-meta-trace-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("abc-123")
+        );
     }
 
     #[test]

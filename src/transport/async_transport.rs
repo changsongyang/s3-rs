@@ -10,12 +10,15 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use reqx::{Client as HttpClient, Response as ReqxResponse};
 use url::Url;
 
+#[cfg(feature = "metrics")]
+use crate::transport::{method_label, status_class};
 use crate::{
     error::{Error, Result},
     transport::{
-        RetryConfig, backoff_delay, followed_redirect, is_retryable_method, map_reqx_error,
-        response_error_from_status, response_service_error, retry_after_from_headers,
-        should_retry_error, should_retry_status, unexpected_redirect_error,
+        RetryConfig, backoff_delay, default_tls_backend, default_user_agent, followed_redirect,
+        is_retryable_method, map_reqx_error, response_error_from_status, response_service_error,
+        retry_delay_from_response, should_retry_error, should_retry_status,
+        unexpected_redirect_error,
     },
 };
 
@@ -457,66 +460,6 @@ impl AsyncTransport {
 pub(crate) async fn response_error(resp: AsyncResponse) -> Error {
     let body_str = String::from_utf8_lossy(resp.body()).to_string();
     response_error_from_status(resp.status(), resp.headers(), &body_str)
-}
-
-fn retry_delay_from_response(
-    config: RetryConfig,
-    attempt: u32,
-    status: StatusCode,
-    headers: &HeaderMap,
-) -> Duration {
-    if status == StatusCode::TOO_MANY_REQUESTS
-        && let Some(retry_after) = retry_after_from_headers(headers)
-    {
-        return retry_after;
-    }
-    backoff_delay(config, attempt)
-}
-
-fn default_tls_backend() -> reqx::TlsBackend {
-    #[cfg(feature = "rustls")]
-    {
-        return reqx::TlsBackend::RustlsRing;
-    }
-    #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-    {
-        return reqx::TlsBackend::NativeTls;
-    }
-    #[allow(unreachable_code)]
-    reqx::TlsBackend::RustlsRing
-}
-
-#[cfg(feature = "metrics")]
-fn status_class(status: StatusCode) -> &'static str {
-    if status.is_informational() {
-        "1xx"
-    } else if status.is_success() {
-        "2xx"
-    } else if status.is_redirection() {
-        "3xx"
-    } else if status.is_client_error() {
-        "4xx"
-    } else if status.is_server_error() {
-        "5xx"
-    } else {
-        "other"
-    }
-}
-
-#[cfg(feature = "metrics")]
-fn method_label(method: &Method) -> &'static str {
-    match method.as_str() {
-        "GET" => "GET",
-        "PUT" => "PUT",
-        "HEAD" => "HEAD",
-        "DELETE" => "DELETE",
-        "POST" => "POST",
-        _ => "OTHER",
-    }
-}
-
-fn default_user_agent() -> String {
-    format!("s3/{}", env!("CARGO_PKG_VERSION"))
 }
 
 fn ensure_empty_body(body: &AsyncBody) -> Result<()> {

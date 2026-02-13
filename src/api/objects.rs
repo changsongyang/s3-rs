@@ -8,7 +8,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
 #[cfg(feature = "multipart")]
 use super::common::validate_max_parts;
-use super::common::{parse_xml_or_service_error, validate_max_keys};
+use super::common::{apply_metadata_headers, parse_xml_or_service_error, validate_max_keys};
 
 use crate::{
     client::Client,
@@ -644,12 +644,7 @@ impl PutObjectRequest {
             headers.insert(http::header::EXPIRES, value);
         }
 
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         #[cfg(feature = "checksums")]
         if let Some(checksum) = self.checksum {
@@ -871,12 +866,7 @@ impl CopyObjectRequest {
             headers.insert(http::header::CONTENT_TYPE, value);
         }
 
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         let resp = self
             .client
@@ -944,12 +934,7 @@ impl CreateMultipartUploadRequest {
             headers.insert(http::header::CONTENT_TYPE, value);
         }
 
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         let resp = self
             .client
@@ -1505,12 +1490,7 @@ impl PresignObjectRequest {
     /// Builds the presigned request using static credentials.
     pub fn build(self) -> Result<PresignedRequest> {
         let mut headers = self.headers;
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         self.client.presign(
             self.method,
@@ -1525,12 +1505,7 @@ impl PresignObjectRequest {
     /// Builds the presigned request using the current credential provider.
     pub async fn build_async(self) -> Result<PresignedRequest> {
         let mut headers = self.headers;
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         self.client
             .presign_async(
@@ -1584,12 +1559,7 @@ impl PresignGetObjectRequest {
     /// Builds the presigned request using static credentials.
     pub fn build(self) -> Result<PresignedRequest> {
         let mut headers = self.headers;
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         self.client.presign(
             Method::GET,
@@ -1604,12 +1574,7 @@ impl PresignGetObjectRequest {
     /// Builds the presigned request using the current credential provider.
     pub async fn build_async(self) -> Result<PresignedRequest> {
         let mut headers = self.headers;
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         self.client
             .presign_async(
@@ -1663,12 +1628,7 @@ impl PresignPutObjectRequest {
     /// Builds the presigned request using static credentials.
     pub fn build(self) -> Result<PresignedRequest> {
         let mut headers = self.headers;
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         self.client.presign(
             Method::PUT,
@@ -1683,12 +1643,7 @@ impl PresignPutObjectRequest {
     /// Builds the presigned request using the current credential provider.
     pub async fn build_async(self) -> Result<PresignedRequest> {
         let mut headers = self.headers;
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         self.client
             .presign_async(

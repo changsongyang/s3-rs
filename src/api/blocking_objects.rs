@@ -8,7 +8,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use super::blocking_common::read_body_string;
 #[cfg(feature = "multipart")]
 use super::common::validate_max_parts;
-use super::common::{parse_xml_or_service_error, validate_max_keys};
+use super::common::{apply_metadata_headers, parse_xml_or_service_error, validate_max_keys};
 
 use crate::{
     client::BlockingClient,
@@ -602,12 +602,7 @@ impl BlockingPutObjectRequest {
             headers.insert(http::header::EXPIRES, value);
         }
 
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         #[cfg(feature = "checksums")]
         if let Some(checksum) = self.checksum {
@@ -807,12 +802,7 @@ impl BlockingCopyObjectRequest {
             headers.insert(http::header::CONTENT_TYPE, value);
         }
 
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         let resp = self.client.execute(
             Method::PUT,
@@ -875,12 +865,7 @@ impl BlockingCreateMultipartUploadRequest {
             headers.insert(http::header::CONTENT_TYPE, value);
         }
 
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         let resp = self.client.execute(
             Method::POST,
@@ -1406,12 +1391,7 @@ impl BlockingPresignObjectRequest {
     /// Builds the presigned request.
     pub fn build(self) -> Result<PresignedRequest> {
         let mut headers = self.headers;
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         self.client.presign(
             self.method,
@@ -1463,12 +1443,7 @@ impl BlockingPresignGetObjectRequest {
     /// Builds the presigned request.
     pub fn build(self) -> Result<PresignedRequest> {
         let mut headers = self.headers;
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         self.client.presign(
             Method::GET,
@@ -1520,12 +1495,7 @@ impl BlockingPresignPutObjectRequest {
     /// Builds the presigned request.
     pub fn build(self) -> Result<PresignedRequest> {
         let mut headers = self.headers;
-        for (name, value) in self.metadata {
-            let header_name = crate::util::redact::metadata_header_name(&name)?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-            headers.insert(header_name, value);
-        }
+        apply_metadata_headers(&mut headers, self.metadata)?;
 
         self.client.presign(
             Method::PUT,

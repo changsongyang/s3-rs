@@ -4,6 +4,8 @@ use http::{HeaderMap, Method};
 use time::OffsetDateTime;
 use url::Url;
 
+use super::common::{sign_with_snapshot, validate_presign_credentials_lifetime};
+
 use crate::{
     api,
     auth::{AddressingStyle, Auth, Region},
@@ -110,13 +112,13 @@ impl Client {
                 AsyncBody::Stream { .. } => util::signing::UNSIGNED_PAYLOAD.to_string(),
             };
 
-            util::signing::sign_headers(
+            sign_with_snapshot(
                 &method,
                 &resolved,
                 &mut headers,
                 &payload_hash,
                 &self.inner.region,
-                snapshot.credentials(),
+                &snapshot,
                 now,
             )?;
         }
@@ -152,13 +154,13 @@ impl Client {
                 AsyncBody::Stream { .. } => util::signing::UNSIGNED_PAYLOAD.to_string(),
             };
 
-            util::signing::sign_headers(
+            sign_with_snapshot(
                 &method,
                 &resolved,
                 &mut headers,
                 &payload_hash,
                 &self.inner.region,
-                snapshot.credentials(),
+                &snapshot,
                 now,
             )?;
         }
@@ -228,19 +230,7 @@ impl Client {
         )?;
 
         let now = OffsetDateTime::now_utc();
-        if let Some(expires_at) = snapshot.expires_at() {
-            if expires_at <= now {
-                return Err(Error::invalid_config("credentials are expired"));
-            }
-            let remaining: std::time::Duration = (expires_at - now).try_into().map_err(|_| {
-                Error::invalid_config("failed to calculate credentials expiration window")
-            })?;
-            if remaining < expires_in {
-                return Err(Error::invalid_config(
-                    "presign expires_in exceeds credentials lifetime",
-                ));
-            }
-        }
+        validate_presign_credentials_lifetime(&snapshot, expires_in, now)?;
 
         util::signing::presign(
             method,

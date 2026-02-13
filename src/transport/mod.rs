@@ -46,6 +46,54 @@ pub(crate) fn backoff_delay(config: RetryConfig, attempt: u32) -> Duration {
     Duration::from_millis(jitter as u64)
 }
 
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn default_tls_backend() -> reqx::TlsBackend {
+    #[cfg(feature = "rustls")]
+    {
+        return reqx::TlsBackend::RustlsRing;
+    }
+    #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+    {
+        return reqx::TlsBackend::NativeTls;
+    }
+    #[allow(unreachable_code)]
+    reqx::TlsBackend::RustlsRing
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn default_user_agent() -> String {
+    format!("s3/{}", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(all(feature = "metrics", any(feature = "async", feature = "blocking")))]
+pub(crate) fn status_class(status: StatusCode) -> &'static str {
+    if status.is_informational() {
+        "1xx"
+    } else if status.is_success() {
+        "2xx"
+    } else if status.is_redirection() {
+        "3xx"
+    } else if status.is_client_error() {
+        "4xx"
+    } else if status.is_server_error() {
+        "5xx"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(all(feature = "metrics", any(feature = "async", feature = "blocking")))]
+pub(crate) fn method_label(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "PUT" => "PUT",
+        "HEAD" => "HEAD",
+        "DELETE" => "DELETE",
+        "POST" => "POST",
+        _ => "OTHER",
+    }
+}
+
 fn jitter_millis(max_millis: u128) -> u128 {
     if max_millis <= 1 {
         return max_millis;
@@ -90,6 +138,26 @@ pub(crate) fn retry_after_from_headers(headers: &http::HeaderMap) -> Option<Dura
         .get(http::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_retry_after_value)
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn clamp_retry_after(config: RetryConfig, retry_after: Duration) -> Duration {
+    retry_after.min(config.max_delay)
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn retry_delay_from_response(
+    config: RetryConfig,
+    attempt: u32,
+    status: StatusCode,
+    headers: &http::HeaderMap,
+) -> Duration {
+    if status == StatusCode::TOO_MANY_REQUESTS
+        && let Some(retry_after) = retry_after_from_headers(headers)
+    {
+        return clamp_retry_after(config, retry_after);
+    }
+    backoff_delay(config, attempt)
 }
 
 #[cfg(any(feature = "async", feature = "blocking"))]
@@ -273,7 +341,11 @@ fn redacted_url_for_error(url: &Url) -> String {
         }
     }
 
-    out.push_str(url.path());
+    if url.path() == "/" {
+        out.push('/');
+    } else {
+        out.push_str("/<redacted>");
+    }
     if url.query().is_some() {
         out.push_str("?<redacted>");
     }
@@ -393,6 +465,25 @@ mod tests {
 
     #[cfg(any(feature = "async", feature = "blocking"))]
     #[test]
+    fn clamp_retry_after_respects_retry_policy_cap() {
+        let config = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(2),
+        };
+
+        assert_eq!(
+            clamp_retry_after(config, Duration::from_millis(500)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            clamp_retry_after(config, Duration::from_secs(30)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
     fn response_error_from_status_maps_common_status_matrix() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -486,8 +577,9 @@ mod tests {
 
         match err {
             crate::error::Error::Transport { message, .. } => {
-                assert!(message.contains("https://example.com/path?<redacted>"));
-                assert!(message.contains("-> https://example.com/path?<redacted>"));
+                assert!(message.contains("https://example.com/<redacted>?<redacted>"));
+                assert!(message.contains("-> https://example.com/<redacted>?<redacted>"));
+                assert!(!message.contains("/path"));
                 assert!(!message.contains("X-Amz-Credential"));
                 assert!(!message.contains("X-Amz-Signature"));
                 assert!(!message.contains("secret-token"));

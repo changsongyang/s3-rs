@@ -1,7 +1,9 @@
 use std::{fmt, sync::Arc, time::Duration};
 
-#[cfg(not(all(feature = "async", not(feature = "blocking"))))]
-use std::sync::{Condvar, Mutex};
+#[cfg(all(feature = "blocking", not(feature = "async")))]
+use std::sync::Condvar;
+#[cfg(not(feature = "async"))]
+use std::sync::Mutex;
 #[cfg(feature = "async")]
 use std::{future::Future, pin::Pin};
 
@@ -213,9 +215,9 @@ struct CachedState {
     last_refresh_attempt: Option<std::time::Instant>,
 }
 
-#[cfg(all(feature = "async", not(feature = "blocking")))]
+#[cfg(feature = "async")]
 type CachedStateLock = tokio::sync::Mutex<CachedState>;
-#[cfg(not(all(feature = "async", not(feature = "blocking"))))]
+#[cfg(not(feature = "async"))]
 type CachedStateLock = Mutex<CachedState>;
 
 /// Cached credentials wrapper with refresh and throttling.
@@ -225,7 +227,7 @@ pub struct CachedProvider<P> {
     refresh_before: Duration,
     min_refresh_interval: Duration,
     state: CachedStateLock,
-    #[cfg(not(all(feature = "async", not(feature = "blocking"))))]
+    #[cfg(all(feature = "blocking", not(feature = "async")))]
     condvar: Condvar,
     #[cfg(feature = "async")]
     notify: tokio::sync::Notify,
@@ -246,7 +248,7 @@ where
                 refreshing: false,
                 last_refresh_attempt: None,
             }),
-            #[cfg(not(all(feature = "async", not(feature = "blocking"))))]
+            #[cfg(all(feature = "blocking", not(feature = "async")))]
             condvar: Condvar::new(),
             #[cfg(feature = "async")]
             notify: tokio::sync::Notify::new(),
@@ -267,7 +269,7 @@ where
 
     /// Seeds the cache with an initial snapshot.
     pub fn with_initial(self, snapshot: CredentialsSnapshot) -> Self {
-        #[cfg(all(feature = "async", not(feature = "blocking")))]
+        #[cfg(feature = "async")]
         {
             let mut state = self
                 .state
@@ -275,7 +277,7 @@ where
                 .expect("cache state must be unlocked during initialization");
             state.cached = Some(snapshot);
         }
-        #[cfg(not(all(feature = "async", not(feature = "blocking"))))]
+        #[cfg(not(feature = "async"))]
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             state.cached = Some(snapshot);
@@ -345,7 +347,7 @@ where
         )
     }
 
-    #[cfg(feature = "blocking")]
+    #[cfg(all(feature = "blocking", not(feature = "async")))]
     fn get_blocking(&self, force: bool) -> Result<CredentialsSnapshot> {
         use std::time::Instant;
 
@@ -408,8 +410,6 @@ where
                     state.cached = Some(snapshot.clone());
                     drop(state);
                     self.condvar.notify_all();
-                    #[cfg(feature = "async")]
-                    self.notify.notify_waiters();
                     return Ok(snapshot);
                 }
                 Err(err) => {
@@ -417,8 +417,6 @@ where
                     let fallback = fallback.filter(|s| !Self::is_expired(s, fallback_now));
                     drop(state);
                     self.condvar.notify_all();
-                    #[cfg(feature = "async")]
-                    self.notify.notify_waiters();
                     if let Some(snapshot) = fallback {
                         return Ok(snapshot);
                     }
@@ -428,14 +426,14 @@ where
         }
     }
 
-    #[cfg(all(feature = "async", feature = "blocking"))]
-    async fn get_async(&self, force: bool) -> Result<CredentialsSnapshot> {
+    #[cfg(all(feature = "blocking", feature = "async"))]
+    fn get_blocking(&self, force: bool) -> Result<CredentialsSnapshot> {
         use std::time::Instant;
 
         loop {
             let now_utc = OffsetDateTime::now_utc();
-            let (fallback, notified) = {
-                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let (fallback, should_refresh) = {
+                let mut state = self.state.blocking_lock();
 
                 if let Some(cached) = state.cached.as_ref() {
                     if !self.should_refresh(cached, now_utc, force) {
@@ -451,8 +449,7 @@ where
                 }
 
                 if state.refreshing {
-                    let notified = self.notify.notified();
-                    (state.cached.clone(), Some(notified))
+                    (state.cached.clone(), false)
                 } else {
                     let has_usable_fallback = state
                         .cached
@@ -467,24 +464,23 @@ where
                     }
                     state.refreshing = true;
                     state.last_refresh_attempt = Some(Instant::now());
-                    (state.cached.clone(), None)
+                    (state.cached.clone(), true)
                 }
             };
 
-            if let Some(notified) = notified {
-                notified.await;
+            if !should_refresh {
+                std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
 
-            let refreshed = self.inner.credentials_async().await;
+            let refreshed = self.inner.credentials_blocking();
 
-            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.state.blocking_lock();
             state.refreshing = false;
             match refreshed {
                 Ok(snapshot) => {
                     state.cached = Some(snapshot.clone());
                     drop(state);
-                    self.condvar.notify_all();
                     self.notify.notify_waiters();
                     return Ok(snapshot);
                 }
@@ -492,7 +488,6 @@ where
                     let fallback_now = OffsetDateTime::now_utc();
                     let fallback = fallback.filter(|s| !Self::is_expired(s, fallback_now));
                     drop(state);
-                    self.condvar.notify_all();
                     self.notify.notify_waiters();
                     if let Some(snapshot) = fallback {
                         return Ok(snapshot);
@@ -503,7 +498,7 @@ where
         }
     }
 
-    #[cfg(all(feature = "async", not(feature = "blocking")))]
+    #[cfg(feature = "async")]
     async fn get_async(&self, force: bool) -> Result<CredentialsSnapshot> {
         use std::time::Instant;
 

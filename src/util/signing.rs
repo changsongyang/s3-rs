@@ -146,6 +146,7 @@ pub(crate) fn presign(
             "presign expires_in must be <= 7 days",
         ));
     }
+    validate_existing_presign_query_params(existing_query_params)?;
 
     let mut signing_headers = headers.clone();
     signing_headers.insert(http::header::HOST, host_header_value(&resolved.url)?);
@@ -207,6 +208,28 @@ pub(crate) fn presign(
         url: resolved.url,
         headers: headers.clone(),
     })
+}
+
+fn validate_existing_presign_query_params(
+    existing_query_params: &[(String, String)],
+) -> Result<(), Error> {
+    for (name, _) in existing_query_params {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::invalid_config(
+                "presign query parameter name must not be empty",
+            ));
+        }
+        if name
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-amz-"))
+        {
+            return Err(Error::invalid_config(
+                "presign query parameters must not use reserved x-amz-* names",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn set_amz_headers(
@@ -538,5 +561,39 @@ mod tests {
                 .unwrap(),
             "text/plain"
         );
+    }
+
+    #[test]
+    fn presign_rejects_reserved_amz_query_params() {
+        let endpoint = url::Url::parse("https://example.com").unwrap();
+        let region = Region::new("us-east-1").unwrap();
+        let creds =
+            Credentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY").unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_369_353_600).unwrap();
+        let resolved = s3_url::resolve_url(
+            &endpoint,
+            Some("my-bucket"),
+            Some("a+b"),
+            &[],
+            AddressingStyle::Path,
+        )
+        .unwrap();
+
+        let err = presign(
+            Method::GET,
+            resolved,
+            SigV4Params::for_s3(&region, &creds, now),
+            Duration::from_secs(60),
+            &[("X-Amz-Signature".to_string(), "fake".to_string())],
+            &HeaderMap::new(),
+        )
+        .expect_err("reserved x-amz-* query names must be rejected");
+
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("reserved x-amz-*"));
+            }
+            other => panic!("expected invalid config error, got {other:?}"),
+        }
     }
 }
