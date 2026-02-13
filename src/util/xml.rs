@@ -54,7 +54,11 @@ fn normalize_error_fields(mut error: types::XmlError) -> Option<types::XmlError>
     trim_optional_string(&mut error.request_id);
     trim_optional_string(&mut error.host_id);
 
-    if error.code.is_none() && error.message.is_none() {
+    if error.code.is_none()
+        && error.message.is_none()
+        && error.request_id.is_none()
+        && error.host_id.is_none()
+    {
         return None;
     }
 
@@ -840,6 +844,19 @@ mod tests {
         assert_eq!(err.code.as_deref(), Some("AccessDenied"));
         assert_eq!(err.message.as_deref(), Some("Access denied"));
         assert_eq!(err.request_id.as_deref(), Some("req-outer"));
+    }
+
+    #[test]
+    fn parses_error_xml_with_request_id_only() {
+        let xml = r#"
+<Error>
+  <RequestId>req-only</RequestId>
+</Error>
+"#;
+        let err = parse_error_xml(xml).expect("request-id-only error should parse");
+        assert_eq!(err.code, None);
+        assert_eq!(err.message, None);
+        assert_eq!(err.request_id.as_deref(), Some("req-only"));
     }
 
     #[test]

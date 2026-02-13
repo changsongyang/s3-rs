@@ -6,7 +6,9 @@ use bytes::Bytes;
 use futures_core::Stream;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
-use super::common::parse_xml_or_service_error;
+#[cfg(feature = "multipart")]
+use super::common::validate_max_parts;
+use super::common::{parse_xml_or_service_error, validate_max_keys};
 
 use crate::{
     client::Client,
@@ -19,9 +21,6 @@ use crate::{
 };
 
 const MAX_ERROR_RESPONSE_BODY_BYTES: usize = 256 * 1024;
-const MAX_LIST_OBJECTS_KEYS: u32 = 1_000;
-#[cfg(feature = "multipart")]
-const MAX_LIST_PARTS: u32 = 1_000;
 #[cfg(feature = "multipart")]
 const MAX_UPLOAD_PART_NUMBER: u32 = 10_000;
 
@@ -1418,25 +1417,6 @@ impl ListObjectsV2Request {
             .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
         crate::util::xml::parse_list_objects_v2(&xml)
     }
-}
-
-fn validate_max_keys(max_keys: u32) -> Result<()> {
-    if max_keys == 0 || max_keys > MAX_LIST_OBJECTS_KEYS {
-        return Err(Error::invalid_config(
-            "max_keys must be in the range 1..=1000",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "multipart")]
-fn validate_max_parts(max_parts: u32) -> Result<()> {
-    if max_parts == 0 || max_parts > MAX_LIST_PARTS {
-        return Err(Error::invalid_config(
-            "max_parts must be in the range 1..=1000",
-        ));
-    }
-    Ok(())
 }
 
 /// Pager for ListObjectsV2 responses.

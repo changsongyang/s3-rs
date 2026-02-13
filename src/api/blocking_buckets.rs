@@ -4,7 +4,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
 use super::blocking_common::read_body_string;
-use super::common::create_bucket_location_constraint;
+use super::common::{create_bucket_location_constraint, validate_subresource};
 
 use crate::{
     client::BlockingClient,
@@ -1119,11 +1119,4 @@ impl BlockingDeleteBucketConfigRawRequest {
         let body = read_body_string(body)?;
         Err(response_error(parts.status, &parts.headers, &body))
     }
-}
-
-fn validate_subresource(subresource: &str) -> Result<()> {
-    if subresource.trim().is_empty() {
-        return Err(Error::invalid_config("subresource must not be empty"));
-    }
-    Ok(())
 }

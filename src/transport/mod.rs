@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 #[cfg(feature = "async")]
 pub(crate) mod async_transport;
@@ -45,12 +51,28 @@ fn jitter_millis(max_millis: u128) -> u128 {
         return max_millis;
     }
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u128)
-        .unwrap_or(0);
+    u128::from(next_jitter_u64()) % max_millis
+}
 
-    nanos % max_millis
+fn next_jitter_u64() -> u64 {
+    static JITTER_STATE: OnceLock<AtomicU64> = OnceLock::new();
+    let state = JITTER_STATE.get_or_init(|| {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ u64::from(std::process::id());
+        AtomicU64::new(seed.max(1))
+    });
+
+    let mut current = state.load(Ordering::Relaxed);
+    loop {
+        let next = current.wrapping_mul(6364136223846793005).wrapping_add(1);
+        match state.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[cfg(any(feature = "async", feature = "blocking"))]
@@ -216,17 +238,52 @@ pub(crate) fn unexpected_redirect_error(
     request_url: &Url,
     response_uri: &str,
 ) -> crate::error::Error {
+    let request = redacted_url_for_error(request_url);
+    let response = redacted_response_uri_for_error(response_uri);
     crate::error::Error::transport(
-        format!(
-            "unexpected redirect followed for {method} {} -> {response_uri}",
-            request_url.as_str()
-        ),
+        format!("unexpected redirect followed for {method} {request} -> {response}",),
         None,
     )
 }
 
+#[cfg(any(feature = "async", feature = "blocking"))]
+fn redacted_response_uri_for_error(response_uri: &str) -> String {
+    match Url::parse(response_uri) {
+        Ok(url) => redacted_url_for_error(&url),
+        Err(_) => "<unparseable-uri>".to_string(),
+    }
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+fn redacted_url_for_error(url: &Url) -> String {
+    let mut out = String::new();
+    out.push_str(url.scheme());
+    out.push_str("://");
+    out.push_str(url.host_str().unwrap_or("<unknown-host>"));
+
+    if let Some(port) = url.port() {
+        let default = match url.scheme() {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        };
+        if Some(port) != default {
+            out.push(':');
+            out.push_str(&port.to_string());
+        }
+    }
+
+    out.push_str(url.path());
+    if url.query().is_some() {
+        out.push_str("?<redacted>");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -258,6 +315,15 @@ mod tests {
 
         assert_eq!(backoff_delay(cfg, 1), Duration::from_millis(0));
         assert_eq!(backoff_delay(cfg, 10), Duration::from_millis(0));
+    }
+
+    #[test]
+    fn jitter_millis_produces_varying_values() {
+        let mut seen = BTreeSet::new();
+        for _ in 0..16 {
+            seen.insert(jitter_millis(997));
+        }
+        assert!(seen.len() > 1);
     }
 
     #[cfg(any(feature = "async", feature = "blocking"))]
@@ -410,6 +476,44 @@ mod tests {
 
     #[cfg(any(feature = "async", feature = "blocking"))]
     #[test]
+    fn unexpected_redirect_error_redacts_query_values() {
+        let request_url = Url::parse(
+            "https://example.com/path?X-Amz-Credential=AKIA&X-Amz-Signature=super-secret",
+        )
+        .expect("valid URL");
+        let response_uri = "https://example.com/path?token=secret-token";
+        let err = unexpected_redirect_error(&Method::GET, &request_url, response_uri);
+
+        match err {
+            crate::error::Error::Transport { message, .. } => {
+                assert!(message.contains("https://example.com/path?<redacted>"));
+                assert!(message.contains("-> https://example.com/path?<redacted>"));
+                assert!(!message.contains("X-Amz-Credential"));
+                assert!(!message.contains("X-Amz-Signature"));
+                assert!(!message.contains("secret-token"));
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn unexpected_redirect_error_hides_unparseable_uri_contents() {
+        let request_url =
+            Url::parse("https://example.com/path?X-Amz-Signature=super-secret").expect("valid URL");
+        let err = unexpected_redirect_error(&Method::GET, &request_url, "%%%bad uri%%%");
+        match err {
+            crate::error::Error::Transport { message, .. } => {
+                assert!(message.contains("<unparseable-uri>"));
+                assert!(!message.contains("%%%bad uri%%%"));
+                assert!(!message.contains("super-secret"));
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
     fn response_service_error_detects_embedded_service_error_xml() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -446,6 +550,24 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn response_service_error_maps_request_id_only_error_payload() {
+        let body = r#"<Error><RequestId>req-only</RequestId></Error>"#;
+        let err =
+            response_service_error(http::StatusCode::BAD_REQUEST, &http::HeaderMap::new(), body)
+                .expect("request-id-only payload should be treated as service error");
+        match err {
+            crate::error::Error::Api {
+                status, request_id, ..
+            } => {
+                assert_eq!(status, http::StatusCode::BAD_REQUEST);
+                assert_eq!(request_id.as_deref(), Some("req-only"));
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
     }
 
     #[cfg(any(feature = "async", feature = "blocking"))]
