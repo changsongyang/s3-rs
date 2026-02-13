@@ -92,7 +92,7 @@ impl BlockingClient {
             method = %method,
             bucket_present = bucket.is_some(),
             key_present = key.is_some(),
-            host = self.inner.endpoint.host_str().unwrap_or(""),
+            host = crate::transport::redacted_host_for_trace(&self.inner.endpoint),
         )
         .entered();
 
@@ -215,6 +215,9 @@ impl BlockingClientBuilder {
         }
         if endpoint.host_str().is_none() {
             return Err(Error::invalid_config("endpoint must include host"));
+        }
+        if !endpoint.username().is_empty() || endpoint.password().is_some() {
+            return Err(Error::invalid_config("endpoint must not include user info"));
         }
         if endpoint.query().is_some() || endpoint.fragment().is_some() {
             return Err(Error::invalid_config(
@@ -352,6 +355,20 @@ mod tests {
             .expect("builder should parse")
             .tls_root_store(BlockingTlsRootStore::System);
         assert_eq!(builder.tls_root_store, BlockingTlsRootStore::System);
+    }
+
+    #[test]
+    fn builder_rejects_endpoint_with_user_info() {
+        let err = match BlockingClientBuilder::new("https://user:pass@s3.example.com") {
+            Ok(_) => panic!("endpoint with user info must be rejected"),
+            Err(err) => err,
+        };
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("must not include user info"));
+            }
+            other => panic!("expected invalid config, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "rustls")]

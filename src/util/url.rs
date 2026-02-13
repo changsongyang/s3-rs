@@ -17,6 +17,10 @@ pub(crate) fn resolve_url(
     query_params: &[(String, String)],
     addressing: AddressingStyle,
 ) -> Result<ResolvedUrl, Error> {
+    if !base_url.username().is_empty() || base_url.password().is_some() {
+        return Err(Error::invalid_config("endpoint must not include user info"));
+    }
+
     let mut url = base_url.clone();
 
     let canonical_query_string = crate::util::encode::canonical_query_string(query_params);
@@ -240,6 +244,27 @@ mod tests {
         match err {
             Error::InvalidConfig { message } => {
                 assert!(message.contains("bucket must not be empty"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn endpoint_with_user_info_is_rejected() {
+        let base = Url::parse("https://user:pass@example.com").unwrap();
+        let err = match resolve_url(
+            &base,
+            Some("my-bucket"),
+            Some("key"),
+            &[],
+            AddressingStyle::Path,
+        ) {
+            Ok(_) => panic!("endpoint with user info should be rejected"),
+            Err(err) => err,
+        };
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("must not include user info"));
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
