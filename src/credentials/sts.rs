@@ -8,6 +8,7 @@ use crate::{
 };
 
 const SERVICE: &str = "sts";
+const STS_GLOBAL_ENDPOINT: &str = "https://sts.amazonaws.com";
 
 #[cfg(feature = "async")]
 pub(crate) async fn assume_role_async(
@@ -116,9 +117,7 @@ pub(crate) async fn assume_role_with_web_identity_env_async(
     use std::time::Duration;
 
     let (role_arn, session_name, token) = web_identity_env()?;
-
-    let endpoint = url::Url::parse("https://sts.amazonaws.com")
-        .map_err(|_| Error::invalid_config("invalid STS endpoint URL"))?;
+    let endpoint = web_identity_sts_endpoint(&role_arn)?;
 
     let body = form_body(&[
         ("Action", "AssumeRoleWithWebIdentity"),
@@ -153,6 +152,7 @@ pub(crate) fn assume_role_with_web_identity_env_blocking(
     use std::time::Duration;
 
     let (role_arn, session_name, token) = web_identity_env()?;
+    let endpoint = web_identity_sts_endpoint(&role_arn)?;
 
     let body = form_body(&[
         ("Action", "AssumeRoleWithWebIdentity"),
@@ -169,12 +169,8 @@ pub(crate) fn assume_role_with_web_identity_env_blocking(
     );
 
     let client = sts_blocking_client(Duration::from_secs(10), tls_root_store)?;
-    let (status, headers, text) = send_form_blocking(
-        &client,
-        "https://sts.amazonaws.com/",
-        headers,
-        Bytes::from(body),
-    )?;
+    let (status, headers, text) =
+        send_form_blocking(&client, endpoint.as_str(), headers, Bytes::from(body))?;
 
     if !status.is_success() {
         return Err(sts_api_error(status, &headers, &text));
@@ -243,8 +239,108 @@ fn send_form_blocking(
 }
 
 fn sts_regional_endpoint(region: &Region) -> Result<url::Url, Error> {
-    let url = format!("https://sts.{}.amazonaws.com", region.as_str());
+    sts_regional_endpoint_for_partition(region, None)
+}
+
+fn sts_regional_endpoint_for_partition(
+    region: &Region,
+    partition: Option<&str>,
+) -> Result<url::Url, Error> {
+    let suffix = if matches!(partition, Some("aws-cn")) || region.as_str().starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    };
+    let url = format!("https://sts.{}.{suffix}", region.as_str());
     url::Url::parse(&url).map_err(|_| Error::invalid_config("invalid STS endpoint URL"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StsRegionalEndpointsMode {
+    Legacy,
+    Regional,
+}
+
+impl StsRegionalEndpointsMode {
+    fn parse(value: &str) -> Result<Self, Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "regional" => Ok(Self::Regional),
+            _ => Err(Error::invalid_config(
+                "AWS_STS_REGIONAL_ENDPOINTS must be one of: legacy, regional",
+            )),
+        }
+    }
+}
+
+fn sts_regional_endpoints_mode_from_env() -> Result<Option<StsRegionalEndpointsMode>, Error> {
+    let value = match std::env::var("AWS_STS_REGIONAL_ENDPOINTS") {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    StsRegionalEndpointsMode::parse(&value).map(Some)
+}
+
+fn web_identity_region_from_env() -> Option<String> {
+    std::env::var("AWS_REGION")
+        .ok()
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn partition_from_role_arn(role_arn: &str) -> Option<&str> {
+    let mut parts = role_arn.splitn(6, ':');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some("arn"), Some(partition), Some(_service), Some(_region), Some(_account))
+            if !partition.is_empty() =>
+        {
+            Some(partition)
+        }
+        _ => None,
+    }
+}
+
+fn web_identity_sts_endpoint(role_arn: &str) -> Result<url::Url, Error> {
+    let partition = partition_from_role_arn(role_arn);
+    let region = web_identity_region_from_env();
+    let mode = sts_regional_endpoints_mode_from_env()?;
+    resolve_web_identity_sts_endpoint(partition, region.as_deref(), mode)
+}
+
+fn resolve_web_identity_sts_endpoint(
+    partition: Option<&str>,
+    region: Option<&str>,
+    mode: Option<StsRegionalEndpointsMode>,
+) -> Result<url::Url, Error> {
+    let requires_regional = matches!(partition, Some("aws-cn" | "aws-us-gov"));
+    let use_regional = requires_regional
+        || matches!(
+            mode.unwrap_or(StsRegionalEndpointsMode::Legacy),
+            StsRegionalEndpointsMode::Regional
+        );
+
+    if use_regional {
+        let region = region.ok_or_else(|| {
+            Error::invalid_config(
+                "AWS_REGION or AWS_DEFAULT_REGION is required for regional STS endpoint",
+            )
+        })?;
+        let region = Region::new(region.to_string())?;
+        return sts_regional_endpoint_for_partition(&region, partition);
+    }
+
+    url::Url::parse(STS_GLOBAL_ENDPOINT)
+        .map_err(|_| Error::invalid_config("invalid STS endpoint URL"))
 }
 
 fn web_identity_env() -> Result<(String, String, String), Error> {
@@ -508,6 +604,53 @@ mod tests {
         let region = Region::new("us-east-1").unwrap();
         let url = sts_regional_endpoint(&region).unwrap();
         assert_eq!(url.as_str(), "https://sts.us-east-1.amazonaws.com/");
+    }
+
+    #[test]
+    fn builds_regional_endpoint_for_cn_region() {
+        let region = Region::new("cn-north-1").unwrap();
+        let url = sts_regional_endpoint(&region).unwrap();
+        assert_eq!(url.as_str(), "https://sts.cn-north-1.amazonaws.com.cn/");
+    }
+
+    #[test]
+    fn resolve_web_identity_sts_endpoint_defaults_to_global() {
+        let url = resolve_web_identity_sts_endpoint(None, None, None).unwrap();
+        assert_eq!(url.as_str(), "https://sts.amazonaws.com/");
+    }
+
+    #[test]
+    fn resolve_web_identity_sts_endpoint_uses_regional_when_requested() {
+        let url = resolve_web_identity_sts_endpoint(
+            Some("aws"),
+            Some("eu-west-1"),
+            Some(StsRegionalEndpointsMode::Regional),
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://sts.eu-west-1.amazonaws.com/");
+    }
+
+    #[test]
+    fn resolve_web_identity_sts_endpoint_requires_region_for_cn_partition() {
+        let err = resolve_web_identity_sts_endpoint(Some("aws-cn"), None, None)
+            .expect_err("aws-cn should require a regional endpoint");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("AWS_REGION or AWS_DEFAULT_REGION"));
+            }
+            other => panic!("expected invalid config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_web_identity_sts_endpoint_uses_cn_regional_suffix() {
+        let url = resolve_web_identity_sts_endpoint(
+            Some("aws-cn"),
+            Some("cn-northwest-1"),
+            Some(StsRegionalEndpointsMode::Legacy),
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://sts.cn-northwest-1.amazonaws.com.cn/");
     }
 
     #[test]

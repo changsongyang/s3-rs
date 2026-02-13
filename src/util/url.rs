@@ -35,6 +35,9 @@ pub(crate) fn resolve_url(
             canonical_query_string,
         });
     };
+    if bucket.trim().is_empty() {
+        return Err(Error::invalid_config("bucket must not be empty"));
+    }
 
     let host = base_url
         .host_str()
@@ -225,5 +228,20 @@ mod tests {
 
         assert_eq!(resolved.canonical_query_string, "a=&b=2");
         assert_eq!(resolved.url.query().unwrap_or(""), "a=&b=2");
+    }
+
+    #[test]
+    fn empty_bucket_is_rejected() {
+        let base = Url::parse("https://example.com").unwrap();
+        let err = match resolve_url(&base, Some("   "), Some("key"), &[], AddressingStyle::Path) {
+            Ok(_) => panic!("empty bucket should be rejected"),
+            Err(err) => err,
+        };
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("bucket must not be empty"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
     }
 }

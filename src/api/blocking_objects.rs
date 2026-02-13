@@ -20,6 +20,11 @@ use crate::{
 };
 
 const MAX_ERROR_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+const MAX_LIST_OBJECTS_KEYS: u32 = 1_000;
+#[cfg(feature = "multipart")]
+const MAX_LIST_PARTS: u32 = 1_000;
+#[cfg(feature = "multipart")]
+const MAX_UPLOAD_PART_NUMBER: u32 = 10_000;
 
 #[cfg(feature = "multipart")]
 use crate::types::{
@@ -922,12 +927,9 @@ impl BlockingUploadPartRequest {
 
     /// Sends the request.
     pub fn send(self) -> Result<UploadPartOutput> {
-        match &self.body {
-            BlockingBody::Bytes(_) => {}
-            BlockingBody::Empty => {
-                return Err(Error::invalid_config("upload_part requires a request body"));
-            }
-        }
+        validate_upload_part_body(&self.body)?;
+        validate_upload_part_number(self.part_number)?;
+        validate_upload_id(&self.upload_id)?;
 
         let query = vec![
             ("partNumber".to_string(), self.part_number.to_string()),
@@ -953,6 +955,32 @@ impl BlockingUploadPartRequest {
             etag: crate::util::headers::header_string(resp.headers(), http::header::ETAG),
         })
     }
+}
+
+#[cfg(feature = "multipart")]
+fn validate_upload_part_body(body: &BlockingBody) -> Result<()> {
+    if matches!(body, BlockingBody::Empty) {
+        return Err(Error::invalid_config("upload_part requires a request body"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "multipart")]
+fn validate_upload_part_number(part_number: u32) -> Result<()> {
+    if part_number == 0 || part_number > MAX_UPLOAD_PART_NUMBER {
+        return Err(Error::invalid_config(
+            "part_number must be in the range 1..=10000",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "multipart")]
+fn validate_upload_id(upload_id: &str) -> Result<()> {
+    if upload_id.trim().is_empty() {
+        return Err(Error::invalid_config("upload_id must not be empty"));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "multipart")]
@@ -985,6 +1013,9 @@ impl BlockingUploadPartCopyRequest {
 
     /// Sends the request.
     pub fn send(self) -> Result<UploadPartCopyOutput> {
+        validate_upload_part_number(self.part_number)?;
+        validate_upload_id(&self.upload_id)?;
+
         let mut headers = HeaderMap::new();
 
         let copy_source = crate::util::headers::copy_source_header_value(
@@ -1151,8 +1182,11 @@ impl BlockingListPartsRequest {
 
     /// Sends the request.
     pub fn send(self) -> Result<ListPartsOutput> {
+        validate_upload_id(&self.upload_id)?;
+
         let mut query = vec![("uploadId".to_string(), self.upload_id)];
         if let Some(v) = self.max_parts {
+            validate_max_parts(v)?;
             query.push(("max-parts".to_string(), v.to_string()));
         }
         if let Some(v) = self.part_number_marker {
@@ -1255,6 +1289,7 @@ impl BlockingListObjectsV2Request {
             query.push(("start-after".to_string(), v));
         }
         if let Some(v) = self.max_keys {
+            validate_max_keys(v)?;
             query.push(("max-keys".to_string(), v.to_string()));
         }
 
@@ -1277,6 +1312,25 @@ impl BlockingListObjectsV2Request {
         let xml = read_body_string(body)?;
         crate::util::xml::parse_list_objects_v2(&xml)
     }
+}
+
+fn validate_max_keys(max_keys: u32) -> Result<()> {
+    if max_keys == 0 || max_keys > MAX_LIST_OBJECTS_KEYS {
+        return Err(Error::invalid_config(
+            "max_keys must be in the range 1..=1000",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "multipart")]
+fn validate_max_parts(max_parts: u32) -> Result<()> {
+    if max_parts == 0 || max_parts > MAX_LIST_PARTS {
+        return Err(Error::invalid_config(
+            "max_parts must be in the range 1..=1000",
+        ));
+    }
+    Ok(())
 }
 
 /// Pager for ListObjectsV2 responses.
@@ -1638,6 +1692,90 @@ mod tests {
         match err {
             Error::Decode { .. } => {}
             other => panic!("expected Decode error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn validate_upload_part_body_rejects_empty() {
+        let err =
+            validate_upload_part_body(&BlockingBody::Empty).expect_err("expected invalid body");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("upload_part requires a request body"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn validate_upload_part_number_rejects_out_of_range() {
+        let err = validate_upload_part_number(0).expect_err("expected invalid part_number");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("part_number"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        let err = validate_upload_part_number(10_001).expect_err("expected invalid part_number");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("part_number"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn validate_upload_id_rejects_empty() {
+        let err = validate_upload_id("  ").expect_err("expected invalid upload_id");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("upload_id"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn validate_max_parts_rejects_out_of_range() {
+        let err = validate_max_parts(0).expect_err("expected invalid max_parts");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("max_parts"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        let err = validate_max_parts(1_001).expect_err("expected invalid max_parts");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("max_parts"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_max_keys_rejects_out_of_range() {
+        let err = validate_max_keys(0).expect_err("expected invalid max_keys");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("max_keys"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        let err = validate_max_keys(1_001).expect_err("expected invalid max_keys");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("max_keys"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
         }
     }
 }
