@@ -90,8 +90,8 @@ impl Client {
         let _guard = tracing::info_span!(
             "s3.request",
             method = %method,
-            bucket = bucket.unwrap_or(""),
-            key = key.unwrap_or(""),
+            bucket_present = bucket.is_some(),
+            key_present = key.is_some(),
             host = self.inner.endpoint.host_str().unwrap_or(""),
         )
         .entered();

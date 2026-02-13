@@ -18,6 +18,10 @@ pub enum Error {
     RateLimited {
         retry_after: Option<Duration>,
         request_id: Option<String>,
+        code: Option<String>,
+        message: Option<String>,
+        host_id: Option<String>,
+        body_snippet: Option<String>,
     },
 
     /// Service returned an error response.
@@ -56,10 +60,18 @@ impl fmt::Debug for Error {
             Self::RateLimited {
                 retry_after,
                 request_id,
+                code,
+                message,
+                host_id,
+                body_snippet,
             } => f
                 .debug_struct("RateLimited")
                 .field("retry_after", retry_after)
                 .field("request_id", request_id)
+                .field("code", code)
+                .field("message", message)
+                .field("host_id", host_id)
+                .field("body_snippet", body_snippet)
                 .finish(),
             Self::Api {
                 status,
@@ -153,6 +165,52 @@ impl Error {
         }
     }
 
+    /// Returns the service error code when available.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Api { code, .. } | Self::RateLimited { code, .. } => code.as_deref(),
+            Self::InvalidConfig { .. }
+            | Self::Signing { .. }
+            | Self::Transport { .. }
+            | Self::Decode { .. } => None,
+        }
+    }
+
+    /// Returns the service error message when available.
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::Api { message, .. } | Self::RateLimited { message, .. } => message.as_deref(),
+            Self::InvalidConfig { .. }
+            | Self::Signing { .. }
+            | Self::Transport { .. }
+            | Self::Decode { .. } => None,
+        }
+    }
+
+    /// Returns the service host id when available.
+    pub fn host_id(&self) -> Option<&str> {
+        match self {
+            Self::Api { host_id, .. } | Self::RateLimited { host_id, .. } => host_id.as_deref(),
+            Self::InvalidConfig { .. }
+            | Self::Signing { .. }
+            | Self::Transport { .. }
+            | Self::Decode { .. } => None,
+        }
+    }
+
+    /// Returns a truncated response body snippet when available.
+    pub fn body_snippet(&self) -> Option<&str> {
+        match self {
+            Self::Api { body_snippet, .. } | Self::RateLimited { body_snippet, .. } => {
+                body_snippet.as_deref()
+            }
+            Self::InvalidConfig { .. }
+            | Self::Signing { .. }
+            | Self::Transport { .. }
+            | Self::Decode { .. } => None,
+        }
+    }
+
     /// Returns true if the error is safe to retry.
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -212,11 +270,24 @@ impl fmt::Display for Error {
         match self {
             Self::InvalidConfig { message } => write!(f, "invalid config: {message}"),
             Self::Signing { message } => write!(f, "signing error: {message}"),
-            Self::RateLimited { retry_after, .. } => write!(
-                f,
-                "rate limited{}",
-                Self::format_rate_limited_retry_after(retry_after)
-            ),
+            Self::RateLimited {
+                retry_after,
+                code,
+                message,
+                request_id,
+                host_id,
+                ..
+            } => {
+                let retry_after = Self::format_rate_limited_retry_after(retry_after);
+                let code = format_optional_field("code", code);
+                let request_id = format_optional_field("request_id", request_id);
+                let host_id = format_optional_field("host_id", host_id);
+                let msg = format_optional_message(message);
+                write!(
+                    f,
+                    "rate limited{retry_after}{code}{request_id}{host_id}{msg}"
+                )
+            }
             Self::Api {
                 status,
                 code,

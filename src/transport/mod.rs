@@ -154,7 +154,7 @@ pub(crate) fn retry_delay_from_response(
     status: StatusCode,
     headers: &http::HeaderMap,
 ) -> Duration {
-    if status == StatusCode::TOO_MANY_REQUESTS
+    if should_retry_status(status)
         && let Some(retry_after) = retry_after_from_headers(headers)
     {
         return clamp_retry_after(config, retry_after);
@@ -188,16 +188,32 @@ pub(crate) fn response_error_from_status(
     body: &str,
 ) -> crate::error::Error {
     let request_id = request_id_from_headers(headers);
+    let parsed = crate::util::xml::parse_error_xml(body);
+    let snippet = crate::util::text::truncate_snippet(body, 4096);
 
     if status == http::StatusCode::TOO_MANY_REQUESTS {
+        if let Some(parsed) = parsed {
+            return crate::error::Error::RateLimited {
+                retry_after: retry_after_from_headers(headers),
+                request_id: parsed.request_id.or(request_id),
+                code: parsed.code,
+                message: parsed.message,
+                host_id: parsed.host_id,
+                body_snippet: Some(snippet),
+            };
+        }
+
         return crate::error::Error::RateLimited {
             retry_after: retry_after_from_headers(headers),
             request_id,
+            code: None,
+            message: None,
+            host_id: None,
+            body_snippet: Some(snippet),
         };
     }
 
-    let snippet = crate::util::text::truncate_snippet(body, 4096);
-    if let Some(parsed) = crate::util::xml::parse_error_xml(body) {
+    if let Some(parsed) = parsed {
         return crate::error::Error::Api {
             status,
             code: parsed.code,
@@ -343,11 +359,7 @@ pub(crate) fn redacted_url_for_error(url: &Url) -> String {
         }
     }
 
-    if url.path() == "/" {
-        out.push('/');
-    } else {
-        out.push_str("/<redacted>");
-    }
+    out.push_str(redacted_path_for_trace(url));
     if url.query().is_some() {
         out.push_str("?<redacted>");
     }
@@ -357,6 +369,15 @@ pub(crate) fn redacted_url_for_error(url: &Url) -> String {
 #[cfg(any(feature = "async", feature = "blocking"))]
 pub(crate) fn redacted_request_context(method: &Method, url: &Url) -> String {
     format!("{method} {}", redacted_url_for_error(url))
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn redacted_path_for_trace(url: &Url) -> &'static str {
+    if url.path() == "/" {
+        "/"
+    } else {
+        "/<redacted>"
+    }
 }
 
 #[cfg(test)]
@@ -498,6 +519,27 @@ mod tests {
 
     #[cfg(any(feature = "async", feature = "blocking"))]
     #[test]
+    fn retry_delay_from_response_uses_retry_after_for_503() {
+        let config = RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(2),
+            max_retry_after: Duration::from_secs(30),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RETRY_AFTER,
+            http::HeaderValue::from_static("5"),
+        );
+
+        assert_eq!(
+            retry_delay_from_response(config, 1, http::StatusCode::SERVICE_UNAVAILABLE, &headers),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
     fn response_error_from_status_maps_common_status_matrix() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -538,9 +580,16 @@ mod tests {
             crate::error::Error::RateLimited {
                 retry_after,
                 request_id,
+                code,
+                message,
+                host_id,
+                ..
             } => {
                 assert_eq!(retry_after, Some(Duration::from_secs(3)));
                 assert_eq!(request_id.as_deref(), Some("req-matrix"));
+                assert!(code.is_none());
+                assert!(message.is_none());
+                assert!(host_id.is_none());
             }
             other => panic!("expected RateLimited for 429, got {other:?}"),
         }
@@ -626,6 +675,57 @@ mod tests {
         assert!(ctx.contains("GET https://example.com/<redacted>?<redacted>"));
         assert!(!ctx.contains("private/key/path"));
         assert!(!ctx.contains("token=secret"));
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn redacted_path_for_trace_hides_object_paths() {
+        let root = Url::parse("https://example.com/").expect("url");
+        let object = Url::parse("https://example.com/a/b/c?token=secret").expect("url");
+        assert_eq!(redacted_path_for_trace(&root), "/");
+        assert_eq!(redacted_path_for_trace(&object), "/<redacted>");
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn response_error_from_status_429_preserves_service_error_fields() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-request-id",
+            http::HeaderValue::from_static("req-outer"),
+        );
+
+        let body = r#"
+<Error>
+  <Code>SlowDown</Code>
+  <Message>slow down</Message>
+  <RequestId>req-inner</RequestId>
+  <HostId>host-1</HostId>
+</Error>
+"#;
+
+        match response_error_from_status(http::StatusCode::TOO_MANY_REQUESTS, &headers, body) {
+            crate::error::Error::RateLimited {
+                request_id,
+                code,
+                message,
+                host_id,
+                body_snippet,
+                ..
+            } => {
+                assert_eq!(request_id.as_deref(), Some("req-inner"));
+                assert_eq!(code.as_deref(), Some("SlowDown"));
+                assert_eq!(message.as_deref(), Some("slow down"));
+                assert_eq!(host_id.as_deref(), Some("host-1"));
+                assert!(
+                    body_snippet
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("SlowDown")
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     #[cfg(any(feature = "async", feature = "blocking"))]

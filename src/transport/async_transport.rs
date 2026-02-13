@@ -140,7 +140,8 @@ impl AsyncTransport {
                     "s3.http",
                     method = %method,
                     host = url.host_str().unwrap_or(""),
-                    path = url.path(),
+                    path = crate::transport::redacted_path_for_trace(&url),
+                    has_query = url.query().is_some(),
                     attempt = 1u32,
                 )
                 .entered();
@@ -164,6 +165,15 @@ impl AsyncTransport {
                             .into_response_limited(MAX_BUFFERED_RESPONSE_BODY_BYTES)
                             .await
                             .map_err(|err| map_reqx_error("request failed", err))?;
+                        if let Some(err) = response_service_error(
+                            resp.status(),
+                            resp.headers(),
+                            &resp.text_lossy(),
+                        ) {
+                            if resp.status().is_success() {
+                                return Err(err);
+                            }
+                        }
                         #[cfg(feature = "metrics")]
                         {
                             metrics::counter!(
@@ -207,7 +217,8 @@ impl AsyncTransport {
                         "s3.http",
                         method = %method,
                         host = url.host_str().unwrap_or(""),
-                        path = url.path(),
+                        path = crate::transport::redacted_path_for_trace(&url),
+                        has_query = url.query().is_some(),
                         attempt,
                     )
                     .entered();
@@ -616,6 +627,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_stream_surfaces_embedded_service_error_on_2xx() -> Result<()> {
+        let body = "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (addr, handle, hits) = spawn_test_server(vec![response.into_bytes()])?;
+
+        let retry = RetryConfig {
+            max_attempts: 1,
+            ..RetryConfig::default()
+        };
+        let transport = AsyncTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let stream = futures_util::stream::once(async { Ok(Bytes::from_static(b"hello")) });
+        let err = transport
+            .send(
+                Method::PUT,
+                url,
+                HeaderMap::new(),
+                AsyncBody::Stream {
+                    stream: Box::pin(stream),
+                    content_length: Some(5),
+                },
+            )
+            .await
+            .expect_err("expected embedded error xml to fail request");
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        match err {
+            Error::Api {
+                status,
+                code,
+                message,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(code.as_deref(), Some("AccessDenied"));
+                assert_eq!(message.as_deref(), Some("denied"));
+            }
+            other => panic!("expected api error, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn response_error_extracts_rate_limit() -> Result<()> {
         let (addr, handle, _) = spawn_test_server(vec![
             b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\nx-amz-request-id: req-1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
@@ -646,6 +714,7 @@ mod tests {
             Error::RateLimited {
                 retry_after,
                 request_id,
+                ..
             } => {
                 assert_eq!(retry_after, Some(Duration::from_secs(3)));
                 assert_eq!(request_id.as_deref(), Some("req-1"));

@@ -451,7 +451,7 @@ fn metadata_async_client(
         .redirect_policy(reqx::RedirectPolicy::none())
         .default_status_policy(reqx::StatusPolicy::Response)
         .max_response_body_bytes(1024 * 1024)
-        .tls_backend(default_tls_backend())
+        .tls_backend(crate::transport::default_tls_backend())
         .tls_root_store(tls_root_store)
         .client_name("s3-imds")
         .build()
@@ -469,24 +469,11 @@ fn metadata_blocking_client(
         .redirect_policy(reqx::RedirectPolicy::none())
         .default_status_policy(reqx::StatusPolicy::Response)
         .max_response_body_bytes(1024 * 1024)
-        .tls_backend(default_tls_backend())
+        .tls_backend(crate::transport::default_tls_backend())
         .tls_root_store(tls_root_store)
         .client_name("s3-imds")
         .build()
         .map_err(|e| Error::transport("failed to build HTTP client", Some(Box::new(e))))
-}
-
-fn default_tls_backend() -> reqx::TlsBackend {
-    #[cfg(feature = "rustls")]
-    {
-        return reqx::TlsBackend::RustlsRing;
-    }
-    #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-    {
-        return reqx::TlsBackend::NativeTls;
-    }
-    #[allow(unreachable_code)]
-    reqx::TlsBackend::RustlsRing
 }
 
 #[cfg(test)]
@@ -744,6 +731,7 @@ mod tests {
             Error::RateLimited {
                 retry_after,
                 request_id,
+                ..
             } => {
                 assert_eq!(retry_after, Some(Duration::from_secs(3)));
                 assert_eq!(request_id.as_deref(), Some("req-1"));
@@ -800,6 +788,7 @@ mod tests {
             Error::RateLimited {
                 retry_after,
                 request_id,
+                ..
             } => {
                 assert_eq!(retry_after, Some(Duration::from_secs(3)));
                 assert_eq!(request_id.as_deref(), Some("req-1"));

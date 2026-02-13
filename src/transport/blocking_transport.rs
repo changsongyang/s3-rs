@@ -144,7 +144,8 @@ impl BlockingTransport {
                 "s3.http",
                 method = %method,
                 host = url.host_str().unwrap_or(""),
-                path = url.path(),
+                path = crate::transport::redacted_path_for_trace(&url),
+                has_query = url.query().is_some(),
                 attempt,
             )
             .entered();
@@ -493,6 +494,7 @@ mod tests {
             Error::RateLimited {
                 retry_after,
                 request_id,
+                ..
             } => {
                 assert_eq!(retry_after, Some(Duration::from_secs(3)));
                 assert_eq!(request_id.as_deref(), Some("req-1"));
